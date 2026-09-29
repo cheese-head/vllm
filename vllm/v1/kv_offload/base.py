@@ -102,6 +102,9 @@ class ReqContext:
     _offload_key_positions: dict[OffloadKey, int] = field(
         default_factory=dict, repr=False, init=False
     )
+    _offload_key_parents: dict[OffloadKey, OffloadKey] = field(
+        default_factory=dict, repr=False, init=False
+    )
 
     def set_state(self, val: Any) -> None:
         self._state[type(val)] = val
@@ -114,6 +117,12 @@ class ReqContext:
 
     def get_offload_key_position(self, key: OffloadKey) -> int | None:
         return self._offload_key_positions.get(key)
+
+    def set_offload_key_parent(self, key: OffloadKey, parent: OffloadKey) -> None:
+        self._offload_key_parents[key] = parent
+
+    def get_offload_key_parent(self, key: OffloadKey) -> OffloadKey | None:
+        return self._offload_key_parents.get(key)
 
 
 class LookupResult(Enum):

@@ -434,6 +434,13 @@ class RequestOffloadState:
                     key,
                     len(group_state.offload_keys) * group_config.tokens_per_chunk,
                 )
+                if (
+                    group_config.sliding_window_size_in_chunks is None
+                    and len(group_state.offload_keys) > 1
+                ):
+                    self.req_context.set_offload_key_parent(
+                        key, group_state.offload_keys[-2]
+                    )
 
     def update_block_id_groups(
         self, new_block_id_groups: tuple[list[int], ...] | None
@@ -1002,6 +1009,12 @@ class OffloadingConnectorScheduler:
         hash_idx = boundary_tokens // self.config.tokens_per_hash - 1
         key = make_offload_key(request.block_hashes[hash_idx], group_idx)
         req_context.set_offload_key_position(key, boundary_tokens)
+        group = self.config.kv_group_configs[group_idx]
+        parent_idx = hash_idx - group.hashes_per_chunk
+        if group.sliding_window_size_in_chunks is None and parent_idx >= 0:
+            req_context.set_offload_key_parent(
+                key, make_offload_key(request.block_hashes[parent_idx], group_idx)
+            )
         return key
 
     def _lookup(

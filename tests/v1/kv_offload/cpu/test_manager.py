@@ -309,6 +309,25 @@ def test_cpu_manager_reports_slot_pressure_and_evictions():
     assert stats.reduce()[CPUOffloadingMetrics.CPU_MISSES_AFTER_EVICTION] == 1
 
 
+def test_leaf_first_lru_preserves_resident_prefix():
+    parent, child, newcomer = to_keys([1, 2, 3])
+    context = ReqContext(req_id="lineage")
+    context.set_offload_key_parent(child, parent)
+    manager = make_cpu_manager(num_chunks=2, cache_policy="leaf_first_lru")
+
+    skipped = manager.prepare_store([child], context)
+    assert skipped is not None and not skipped.keys_to_store
+
+    stored = manager.prepare_store([parent, child], context)
+    assert stored is not None and list(stored.keys_to_store) == [parent, child]
+    manager.complete_store([parent, child], context)
+
+    admitted = manager.prepare_store([newcomer], context)
+    assert admitted is not None
+    assert list(admitted.evicted_keys) == [child]
+    assert manager.lookup(parent, context) is LookupResult.HIT
+
+
 def test_cpu_manager_reports_allocation_size_histogram():
     manager = make_cpu_manager(num_chunks=4, cache_policy="lru")
 

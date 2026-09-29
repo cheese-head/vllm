@@ -289,6 +289,10 @@ class CPUOffloadingManager(OffloadingManager):
                 keys_to_store
             )
 
+        for key in keys:
+            self._policy.record_parent(key, req_context.get_offload_key_parent(key))
+        keys_to_store = self._policy.filter_admissible(keys_to_store)
+
         state = self._get_request_cache_access(req_context)
         new_store_misses = [
             key for key in keys_to_store if key not in state.store_miss_keys
@@ -397,7 +401,7 @@ class CPUOffloadingManager(OffloadingManager):
                     self._policy.mark_evictable(key)
                     stored_keys.append(key)
         else:
-            for key in keys:
+            for key in reversed(list(keys)):
                 chunk = self._policy.get(key)
                 if chunk is not None and not chunk.is_ready:
                     self._num_write_pending_chunks -= 1

@@ -89,3 +89,8 @@ CachePolicyFactory.register_cache_policy(
 CachePolicyFactory.register_cache_policy(
     "arc", "vllm.v1.kv_offload.cpu.policies.arc", "ARCCachePolicy"
 )
+CachePolicyFactory.register_cache_policy(
+    "leaf_first_lru",
+    "vllm.v1.kv_offload.cpu.policies.leaf_first_lru",
+    "LeafFirstLRUCachePolicy",
+)
