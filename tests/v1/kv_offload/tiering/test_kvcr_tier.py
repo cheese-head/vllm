@@ -524,6 +524,34 @@ def test_kvcr_tier_stores_and_emits_inventory(monkeypatch):
     tier.shutdown()
 
 
+def test_kvcr_store_reports_successful_keys_in_mixed_batch(monkeypatch):
+    kvcr = RecordingKVCR()
+    tier = _make_tier(monkeypatch, kvcr)
+    keys = [OffloadKey(b"parent"), OffloadKey(b"child")]
+    tier.submit_store(
+        TransferJob(
+            job_id=29,
+            keys=keys,
+            chunk_ids=np.array([0, 1], dtype=np.int32),
+            is_promotion=False,
+            req_context=ReqContext(req_id="mixed"),
+        )
+    )
+    handle, _ = kvcr.deposit_calls[-1]
+    kvcr.completed = [
+        (
+            handle,
+            _op_entries(
+                {BlockKey(bytes(keys[0])): True, BlockKey(bytes(keys[1])): False}
+            ),
+        )
+    ]
+    assert list(tier.get_finished_jobs()) == [
+        JobResult(29, False, successful_keys={keys[0]})
+    ]
+    tier.shutdown()
+
+
 def test_kvcr_tier_requires_self_describing_inventory_events(monkeypatch):
     """Require tier-aware events whenever KVCR owns local cache inventory."""
     with pytest.raises(ValueError, match="self_describing_kv_events"):

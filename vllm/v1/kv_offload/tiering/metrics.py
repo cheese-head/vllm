@@ -146,6 +146,14 @@ class TieringMetricsTracker:
                 (outcome,),
             )
 
+    def on_write_policy_keys(self, tier_idx: int, outcome: str, count: int) -> None:
+        if count:
+            self._stats.increase_counter(
+                TieringOffloadingMetrics.WRITE_POLICY_KEYS,
+                count,
+                (*self.tier_label(tier_idx), outcome),
+            )
+
     def on_hook_duration(self, hook: str, duration: float) -> None:
         self._stats.observe_histogram(
             TieringOffloadingMetrics.HOOK_DURATION, duration, (hook,)
@@ -263,7 +271,7 @@ class TieringMetricsTracker:
                 else TieringOffloadingMetrics.CASCADE_JOB_FAILURES
             )
             self._stats.increase_counter(failure_metric, labelvalues=labelvalues)
-            if transfer_job.is_promotion and completed_job.successful_keys:
+            if completed_job.successful_keys:
                 completed_key_count = len(completed_job.successful_keys)
             else:
                 self._stats.increase_counter(

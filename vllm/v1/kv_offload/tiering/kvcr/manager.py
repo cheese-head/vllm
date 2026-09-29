@@ -264,7 +264,7 @@ class _VllmKeyAdapter:
 
 
 # Job ID, remaining blocks, aggregate success, and successful load keys.
-_JobState = tuple[int, int, bool, set[OffloadKey] | None]
+_JobState = tuple[int, int, bool, set[OffloadKey], bool]
 
 
 class KVCRSecondaryTierManager(SecondaryTierManager):
@@ -492,6 +492,7 @@ class KVCRSecondaryTierManager(SecondaryTierManager):
             len(blocks),
             True,
             set(),
+            True,
         )
 
     @override
@@ -512,7 +513,8 @@ class KVCRSecondaryTierManager(SecondaryTierManager):
             job_metadata.job_id,
             len(blocks),
             True,
-            None,
+            set(),
+            False,
         )
 
     @override
@@ -548,9 +550,9 @@ class KVCRSecondaryTierManager(SecondaryTierManager):
             job_state = self._jobs_by_op.get(op_handle)
             if job_state is None:
                 continue
-            job_id, remaining, success, successful_keys = job_state
+            job_id, remaining, success, successful_keys, is_promotion = job_state
             if self._enable_telemetry:
-                operation = "deliver" if successful_keys is not None else "deposit"
+                operation = "deliver" if is_promotion else "deposit"
                 for entry in entries.values():
                     self._adapter_stats.increase_counter(
                         _ENTRY_RESULTS,
@@ -558,18 +560,18 @@ class KVCRSecondaryTierManager(SecondaryTierManager):
                     )
             remaining -= len(entries)
             success = success and all(entry.success for entry in entries.values())
-            if successful_keys is not None:
-                successful_keys.update(
-                    OffloadKey(bytes(key))
-                    for key, entry in entries.items()
-                    if entry.success
-                )
+            successful_keys.update(
+                OffloadKey(bytes(key))
+                for key, entry in entries.items()
+                if entry.success
+            )
             if remaining > 0:
                 self._jobs_by_op[op_handle] = (
                     job_id,
                     remaining,
                     success,
                     successful_keys,
+                    is_promotion,
                 )
                 continue
             self._jobs_by_op.pop(op_handle, None)
@@ -577,7 +579,9 @@ class KVCRSecondaryTierManager(SecondaryTierManager):
                 JobResult(
                     job_id=job_id,
                     success=success,
-                    successful_keys=successful_keys if not success else None,
+                    successful_keys=successful_keys
+                    if not success and successful_keys
+                    else None,
                 )
             )
         results.extend(self._framework_pin_adapter.take_pin_job_results())

@@ -67,6 +67,7 @@ class TieringOffloadingMetrics:
     PROMOTION_CHUNKS = "vllm:kv_offload_tiering_promotion_chunks"
     HOOK_DURATION = "vllm:kv_offload_tiering_hook_duration_seconds"
     EVICTED_LOOKUP_OUTCOME = "vllm:kv_offload_tiering_evicted_lookup_outcome"
+    WRITE_POLICY_KEYS = "vllm:kv_offload_tiering_write_policy_keys"
 
 
 @dataclass
@@ -88,9 +89,9 @@ class JobResult:
     job_id: JobId
     # True if all keys succeeded; False if all or some failed.
     success: bool
-    # Only applicable to promotion jobs. On partial failure, identifies the
-    # keys that were successfully loaded. None means all keys share the fate
-    # indicated by `success`. Must be a subset of the job's original keys.
+    # On partial failure, identifies keys successfully transferred in either
+    # direction. None means all keys share the fate indicated by `success`.
+    # Must be a subset of the job's original keys.
     successful_keys: Collection[OffloadKey] | None = None
     transfer_time: float | None = None
     transfer_bytes: int | None = None

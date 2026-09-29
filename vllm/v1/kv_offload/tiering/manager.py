@@ -191,6 +191,7 @@ class TieringOffloadingManager(OffloadingManager):
         self,
         primary_tier: CPUPrimaryTierOffloadingManager,
         secondary_tiers: list[SecondaryTierManager] | None = None,
+        write_policies: list[str] | None = None,
     ):
         """Initialize the TieringOffloadingManager.
 
@@ -198,10 +199,19 @@ class TieringOffloadingManager(OffloadingManager):
             primary_tier: The primary tier manager (CPU-based).
             secondary_tiers: List of secondary tier managers (e.g., Storage,
                             Network). Can be None or empty list.
+            write_policies: Per-secondary write behavior.
 
         """
         self.primary_tier: CPUPrimaryTierOffloadingManager = primary_tier
         self.secondary_tiers = secondary_tiers or []
+        self._write_policies = write_policies or [
+            "best_effort" for _ in self.secondary_tiers
+        ]
+        if len(self._write_policies) != len(self.secondary_tiers):
+            raise ValueError("One write policy is required per secondary tier")
+        self._store_status: list[dict[OffloadKey, str]] = [
+            {} for _ in self.secondary_tiers
+        ]
 
         self._job_id_counter: int = 0
         # Job tracking: maps job_id to metadata for all in-flight transfers.
@@ -342,6 +352,20 @@ class TieringOffloadingManager(OffloadingManager):
                 else:
                     # primary→secondary transfer completed.
                     # Decrement ref_cnt on primary chunks.
+                    successful = (
+                        set(transfer_job.keys)
+                        if completed_job.success
+                        else set(completed_job.successful_keys or ())
+                    )
+                    status = self._store_status[i]
+                    for key in transfer_job.keys:
+                        status[key] = (
+                            "lower_confirmed" if key in successful else "failed"
+                        )
+                    self._metrics.on_write_policy_keys(i, "succeeded", len(successful))
+                    self._metrics.on_write_policy_keys(
+                        i, "failed", len(transfer_job.keys) - len(successful)
+                    )
                     self.primary_tier.complete_read(
                         transfer_job.keys, transfer_job.req_context
                     )
@@ -356,6 +380,31 @@ class TieringOffloadingManager(OffloadingManager):
         if detector is None:
             return True
         return detector.should_store(num_blocks)
+
+    def _submit_cascade(
+        self,
+        keys: Collection[OffloadKey],
+        req_context: ReqContext,
+        tier_idx: int,
+    ) -> None:
+        tier = self.secondary_tiers[tier_idx]
+        if self._write_policies[tier_idx] == "tracked_write_through":
+            keys = [
+                key
+                for key in keys
+                if self._store_status[tier_idx].get(key) != "copying"
+            ]
+            if not keys:
+                return
+        if self._write_policies[
+            tier_idx
+        ] == "best_effort" and not self._should_store_to_tier(tier, len(keys)):
+            return
+        job = self.create_store_job(keys, req_context, tier_idx)
+        tier.submit_store(job)
+        for key in keys:
+            self._store_status[tier_idx][key] = "copying"
+        self._metrics.on_write_policy_keys(tier_idx, "submitted", len(keys))
 
     def _update_backpressure(
         self,
@@ -514,6 +563,7 @@ class TieringOffloadingManager(OffloadingManager):
             return False
 
         self._record_unused_promotion_evictions(primary_write_result.evicted_keys)
+        self._forget_primary_keys(primary_write_result.evicted_keys)
 
         store_spec = primary_write_result.store_spec
         assert isinstance(store_spec, CPULoadStoreSpec)
@@ -588,6 +638,11 @@ class TieringOffloadingManager(OffloadingManager):
         self._promoted_unused.difference_update(unused)
         self._metrics.on_promotion_chunks("evicted_unused", len(unused))
 
+    def _forget_primary_keys(self, keys: Collection[OffloadKey]) -> None:
+        for status in self._store_status:
+            for key in keys:
+                status.pop(key, None)
+
     @override
     def touch(self, keys: Collection[OffloadKey], req_context: ReqContext):
         """Mark chunks as recently used in all tiers.
@@ -659,6 +714,7 @@ class TieringOffloadingManager(OffloadingManager):
             return None
 
         self._record_unused_promotion_evictions(primary_result.evicted_keys)
+        self._forget_primary_keys(primary_result.evicted_keys)
 
         if primary_result.keys_to_store:
             state = self._req_state[req_context.req_id]
@@ -713,11 +769,7 @@ class TieringOffloadingManager(OffloadingManager):
             return
 
         for tier_idx in request_level_tiers:
-            tier = self.secondary_tiers[tier_idx]
-            if not self._should_store_to_tier(tier, len(ready_keys)):
-                continue
-            job_metadata = self.create_store_job(ready_keys, req_context, tier_idx)
-            tier.submit_store(job_metadata)
+            self._submit_cascade(ready_keys, req_context, tier_idx)
 
     def _flush_pending_cascades(self) -> None:
         """Retry request-level cascades parked on an in-flight primary write.
@@ -769,11 +821,8 @@ class TieringOffloadingManager(OffloadingManager):
             # LoadStoreSpec AND to increment ref_cnt (protecting chunks from
             # eviction during the async transfer). One prepare_read() call per
             # secondary tier.
-            for tier_idx, tier in enumerate(self.secondary_tiers):
-                if not self._should_store_to_tier(tier, len(keys)):
-                    continue
-                job_metadata = self.create_store_job(keys, req_context, tier_idx)
-                tier.submit_store(job_metadata)
+            for tier_idx in range(len(self.secondary_tiers)):
+                self._submit_cascade(keys, req_context, tier_idx)
 
         # Note: The async transfers are now in flight. Their completion is
         # tracked via get_finished_jobs() / _maybe_process_finished_jobs().
@@ -975,6 +1024,8 @@ class TieringOffloadingManager(OffloadingManager):
             finished_req_ids.append(req_id)
 
         self.primary_tier.reset_cache()
+        for status in self._store_status:
+            status.clear()
         self._promoted_unused.clear()
 
         for req_id in finished_req_ids:

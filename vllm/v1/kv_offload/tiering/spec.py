@@ -268,6 +268,10 @@ class TieringOffloadingSpec(CPUOffloadingSpec):
                 labelnames=("outcome",),
             )
         )
+        metrics[TieringOffloadingMetrics.WRITE_POLICY_KEYS] = OffloadingCounterMetadata(
+            documentation="Secondary write keys submitted and completed by outcome.",
+            labelnames=("tier", "outcome"),
+        )
         metrics[TieringOffloadingMetrics.PROMOTION_JOB_FAILURES] = (
             OffloadingCounterMetadata(
                 documentation=(
@@ -466,9 +470,21 @@ class TieringOffloadingSpec(CPUOffloadingSpec):
 
                 # Create secondary tiers
                 primary_kv_view = primary_tier.get_kv_memoryview()
+                write_policies: list[str] = []
                 for i, tier_config in enumerate(self.secondary_tier_configs):
+                    write_policy = tier_config.get("write_policy", "best_effort")
+                    if write_policy not in ("best_effort", "tracked_write_through"):
+                        raise ValueError(
+                            f"Unsupported secondary write_policy {write_policy}"
+                        )
+                    write_policies.append(write_policy)
+                    tier_runtime_config = {
+                        key: value
+                        for key, value in tier_config.items()
+                        if key != "write_policy"
+                    }
                     tier = SecondaryTierFactory.create_secondary_tier(
-                        tier_config, primary_kv_view, self
+                        tier_runtime_config, primary_kv_view, self
                     )
                     secondary_tiers.append(tier)
                     logger.info(
@@ -483,6 +499,7 @@ class TieringOffloadingSpec(CPUOffloadingSpec):
                 tiering_manager = TieringOffloadingManager(
                     primary_tier=primary_tier,
                     secondary_tiers=secondary_tiers,
+                    write_policies=write_policies,
                 )
                 self._manager = tiering_manager
             except Exception:

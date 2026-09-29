@@ -219,6 +219,36 @@ def test_tiering_manager_aggregates_secondary_stats():
     assert MetricsSecondaryTierManager.MY_TIER_METRIC not in second_stats.data["data"]
 
 
+def test_tracked_write_through_records_mixed_store_results():
+    region = _mock_mmap_region(3)
+    primary = CPUPrimaryTierOffloadingManager(num_chunks=3, mmap_region=region)
+    tier = MetricsSecondaryTierManager(
+        offloading_spec=_MOCK_OFFLOADING_SPEC,
+        primary_kv_view=region.create_kv_memoryview(),
+        tier_type="test_metrics",
+    )
+    manager = TieringOffloadingManager(
+        primary_tier=primary,
+        secondary_tiers=[tier],
+        write_policies=["tracked_write_through"],
+    )
+    context = ReqContext(req_id="tracked")
+    keys = to_keys([1, 2])
+    manager.on_new_request(context)
+    manager.prepare_store(keys, context)
+    manager.complete_store(keys, context)
+    [job] = tier.submitted_stores
+    tier.finished_jobs = [JobResult(job.job_id, False, successful_keys={keys[0]})]
+    manager.on_schedule_end(ScheduleEndContext(new_req_ids=[], preempted_req_ids=()))
+
+    assert manager._store_status[0] == {
+        keys[0]: "lower_confirmed",
+        keys[1]: "failed",
+    }
+    assert primary.lookup(keys[0], context) is LookupResult.HIT
+    assert primary.lookup(keys[1], context) is LookupResult.HIT
+
+
 class TestExampleSecondaryTierManager:
     """Tests for ExampleSecondaryTierManager implementation."""
 
