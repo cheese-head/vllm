@@ -86,6 +86,8 @@ if TYPE_CHECKING:
 
 _REQUIRED_ROUTER_CAPABILITIES = ROUTER_HINT_CAPABILITIES
 
+_ENTRY_RESULTS = "vllm:kvcr_adapter_entry_results"
+
 logger = init_logger(__name__)
 
 _BUILTIN_POLICIES: dict[str, type[KVCachePolicy]] = {
@@ -121,6 +123,10 @@ def _vllm_metric_name(name: str) -> str:
 
 def _kvcr_metric_definitions() -> dict[str, OffloadingMetricMetadata]:
     return {
+        _ENTRY_RESULTS: OffloadingCounterMetadata(
+            documentation="KVCR adapter completion entries by operation and status.",
+            labelnames=("operation", "status"),
+        ),
         _vllm_metric_name(DURATION_METRIC): OffloadingHistogramMetadata(
             documentation="KVCR operation and stage duration in seconds.",
             labelnames=("scope", "result"),
@@ -451,6 +457,8 @@ class KVCRSecondaryTierManager(SecondaryTierManager):
         self._local_dram_mmap = local_mapping
         self._finished_jobs: list[JobResult] = []
         self._jobs_by_op: dict[OpHandle, _JobState] = {}
+        self._enable_telemetry = enable_telemetry
+        self._adapter_stats = OffloadingConnectorStats()
 
     @override
     def lookup(self, key: OffloadKey, req_context: ReqContext) -> LookupResult:
@@ -522,6 +530,12 @@ class KVCRSecondaryTierManager(SecondaryTierManager):
             for metrics in stats.data.values():
                 for name in tuple(metrics):
                     metrics[_vllm_metric_name(name)] = metrics.pop(name)
+        if not self._adapter_stats.is_empty():
+            if stats is None:
+                stats = self._adapter_stats
+            else:
+                stats.aggregate(self._adapter_stats)
+            self._adapter_stats = OffloadingConnectorStats()
         return stats
 
     @override
@@ -535,6 +549,13 @@ class KVCRSecondaryTierManager(SecondaryTierManager):
             if job_state is None:
                 continue
             job_id, remaining, success, successful_keys = job_state
+            if self._enable_telemetry:
+                operation = "deliver" if successful_keys is not None else "deposit"
+                for entry in entries.values():
+                    self._adapter_stats.increase_counter(
+                        _ENTRY_RESULTS,
+                        labelvalues=(operation, entry.status.value.lower()),
+                    )
             remaining -= len(entries)
             success = success and all(entry.success for entry in entries.values())
             if successful_keys is not None:

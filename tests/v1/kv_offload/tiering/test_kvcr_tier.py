@@ -414,6 +414,7 @@ def test_kvcr_telemetry_is_opt_in_and_namespaced_at_vllm_boundary(monkeypatch):
     )
     assert "vllm:kvcr_duration_seconds" in definitions
     assert "vllm:kvcr_transfer_blocks" in definitions
+    assert "vllm:kvcr_adapter_entry_results" in definitions
 
     kvcr = RecordingKVCR()
     tier = _make_tier(monkeypatch, kvcr, enable_telemetry=True)
@@ -432,6 +433,21 @@ def test_kvcr_telemetry_is_opt_in_and_namespaced_at_vllm_boundary(monkeypatch):
 
     assert returned is stats
     assert returned.reduce() == {"vllm:kvcr_transfer_blocks:('remote_deliver',)": 2}
+
+    tier.submit_store(_job(17, ReqContext(req_id="req")))
+    op_handle, blocks = kvcr.deposit_calls[-1]
+    kvcr.completed = [
+        (
+            op_handle,
+            {key: OpEntryResult(OpEntryStatus.DROPPED) for key in blocks},
+        )
+    ]
+    assert list(tier.get_finished_jobs()) == [JobResult(17, False)]
+    outcome_stats = tier.get_stats()
+    assert outcome_stats is not None
+    assert outcome_stats.reduce() == {
+        "vllm:kvcr_adapter_entry_results:('deposit', 'dropped')": 1
+    }
 
 
 @pytest.mark.parametrize(
