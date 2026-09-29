@@ -81,6 +81,7 @@ class TransferJob:
     is_promotion: bool
     req_context: ReqContext
     claim_residency: bool = field(default=False, kw_only=True)
+    source_generations: dict[OffloadKey, int] | None = field(default=None, kw_only=True)
     submit_time: float = field(default_factory=time.monotonic)
 
 

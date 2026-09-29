@@ -481,6 +481,7 @@ class TieringOffloadingSpec(CPUOffloadingSpec):
                         "best_effort",
                         "tracked_write_through",
                         "write_back",
+                        "write_through_invalidate",
                     ):
                         raise ValueError(
                             f"Unsupported secondary write_policy {write_policy}"
@@ -496,6 +497,24 @@ class TieringOffloadingSpec(CPUOffloadingSpec):
                             )
                         if self.eviction_policy not in ("lru", "leaf_first_lru"):
                             raise ValueError("write_back requires an LRU CPU policy")
+                    if write_policy == "write_through_invalidate":
+                        if tier_config.get("type") != "kvcr":
+                            raise ValueError(
+                                "write_through_invalidate requires the KVCR tier"
+                            )
+                        if int(tier_config.get("secondary_g2_slots", 0)) <= 0:
+                            raise ValueError(
+                                "write_through_invalidate requires KVCR local G2 slots"
+                            )
+                        if tier_config.get("kvcr_service_socket_path") is not None:
+                            raise ValueError(
+                                "write_through_invalidate with KVCR Guard "
+                                "is not supported"
+                            )
+                        if self.eviction_policy != "lru":
+                            raise ValueError(
+                                "write_through_invalidate requires the LRU CPU policy"
+                            )
                     write_policies.append(write_policy)
                     tier_runtime_config = {
                         key: value

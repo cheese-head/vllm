@@ -380,6 +380,18 @@ class TieringOffloadingManager(OffloadingManager):
                     self.primary_tier.complete_read(
                         transfer_job.keys, transfer_job.req_context
                     )
+                    if self._write_policies[i] == "write_through_invalidate":
+                        assert transfer_job.source_generations is not None
+                        for key, chunk_id in zip(
+                            transfer_job.keys, transfer_job.chunk_ids
+                        ):
+                            if key in successful:
+                                self.primary_tier.invalidate_if_unpinned(
+                                    key,
+                                    int(chunk_id),
+                                    transfer_job.source_generations[key],
+                                )
+                        self._promoted_unused.difference_update(successful)
                     if completed_job.success:
                         self._update_backpressure(tier, job_metadata, completed_job)
         self._metrics.on_hook_duration("completion_poll", time.monotonic() - start_time)
@@ -400,7 +412,11 @@ class TieringOffloadingManager(OffloadingManager):
     ) -> None:
         tier = self.secondary_tiers[tier_idx]
         policy = self._write_policies[tier_idx]
-        if policy in ("tracked_write_through", "write_back"):
+        if policy in (
+            "tracked_write_through",
+            "write_back",
+            "write_through_invalidate",
+        ):
             keys = [
                 key
                 for key in keys
@@ -916,6 +932,11 @@ class TieringOffloadingManager(OffloadingManager):
             chunk_ids=primary_chunks_spec.chunk_ids,
             is_promotion=False,
             req_context=req_context,
+            source_generations=(
+                {key: self.primary_tier.residency_generation(key) for key in keys}
+                if self._write_policies[tier_idx] == "write_through_invalidate"
+                else None
+            ),
         )
         self._register_job(job_metadata, tier_idx)
         return job_metadata

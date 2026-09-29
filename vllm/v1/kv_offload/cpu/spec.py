@@ -90,6 +90,11 @@ class CPUOffloadingSpec(OffloadingSpec):
             CPUOffloadingMetrics.CPU_EVICTED_CHUNKS: OffloadingCounterMetadata(
                 documentation="CPU cache chunks evicted to admit new chunks."
             ),
+            CPUOffloadingMetrics.CPU_INVALIDATED_CHUNKS: OffloadingCounterMetadata(
+                documentation=(
+                    "CPU chunks invalidated after a confirmed lower-tier copy."
+                )
+            ),
             CPUOffloadingMetrics.CPU_MISSES_AFTER_EVICTION: (
                 OffloadingCounterMetadata(
                     documentation=(

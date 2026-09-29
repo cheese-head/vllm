@@ -283,6 +283,34 @@ def test_write_back_waits_for_lower_residency_claim_before_eviction():
     assert len(result.evicted_keys) == 1
 
 
+def test_write_through_invalidate_retires_only_confirmed_keys():
+    region = _mock_mmap_region(2)
+    primary = CPUPrimaryTierOffloadingManager(num_chunks=2, mmap_region=region)
+    tier = MetricsSecondaryTierManager(
+        offloading_spec=_MOCK_OFFLOADING_SPEC,
+        primary_kv_view=region.create_kv_memoryview(),
+        tier_type="test_metrics",
+    )
+    manager = TieringOffloadingManager(
+        primary_tier=primary,
+        secondary_tiers=[tier],
+        write_policies=["write_through_invalidate"],
+    )
+    context = ReqContext(req_id="invalidate")
+    keys = to_keys([1, 2])
+    manager.on_new_request(context)
+    assert manager.prepare_store(keys, context) is not None
+    manager.complete_store(keys, context)
+    [job] = tier.submitted_stores
+    tier.finished_jobs = [JobResult(job.job_id, False, successful_keys={keys[0]})]
+    manager.on_schedule_end(ScheduleEndContext(new_req_ids=[], preempted_req_ids=()))
+
+    assert primary.lookup(keys[0], context) is LookupResult.MISS
+    assert primary.lookup(keys[1], context) is LookupResult.HIT
+    assert manager._store_status[0][keys[0]] == "lower_confirmed"
+    assert manager._store_status[0][keys[1]] == "failed"
+
+
 class TestExampleSecondaryTierManager:
     """Tests for ExampleSecondaryTierManager implementation."""
 

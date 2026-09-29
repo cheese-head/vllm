@@ -164,6 +164,48 @@ def test_cpu_eviction_removed_precedes_stored():
     assert all(event.medium == manager.medium for event in events)
 
 
+def test_confirmed_lower_copy_invalidates_after_last_cpu_reader():
+    manager = make_cpu_manager(num_chunks=1, enable_events=True)
+    key = to_key(1)
+    output = manager.prepare_store([key], _EMPTY_REQ_CTX)
+    assert output is not None
+    manager.complete_store([key], _EMPTY_REQ_CTX)
+    list(manager.take_events())
+    chunk_id = int(output.store_spec.chunk_ids[0])
+    generation = manager.residency_generation(key)
+
+    manager.prepare_read([key], _EMPTY_REQ_CTX)
+    assert not manager.invalidate_if_unpinned(key, chunk_id, generation)
+    assert manager.lookup(key, _EMPTY_REQ_CTX) is LookupResult.HIT
+    manager.complete_load([key], _EMPTY_REQ_CTX)
+
+    assert manager.lookup(key, _EMPTY_REQ_CTX) is LookupResult.MISS
+    assert manager._get_num_free_chunks() == 1
+    assert [event.removed for event in manager.take_events()] == [True]
+    stats = manager.get_stats()
+    assert stats is not None
+    assert stats.reduce()[CPUOffloadingMetrics.CPU_INVALIDATED_CHUNKS] == 1
+
+
+def test_late_invalidation_does_not_remove_reused_cpu_slot():
+    manager = make_cpu_manager(num_chunks=1)
+    key = to_key(1)
+    output = manager.prepare_store([key], _EMPTY_REQ_CTX)
+    assert output is not None
+    manager.complete_store([key], _EMPTY_REQ_CTX)
+    chunk_id = int(output.store_spec.chunk_ids[0])
+    generation = manager.residency_generation(key)
+    assert manager.invalidate_if_unpinned(key, chunk_id, generation)
+
+    replacement = manager.prepare_store([key], _EMPTY_REQ_CTX)
+    assert replacement is not None
+    manager.complete_store([key], _EMPTY_REQ_CTX)
+    assert int(replacement.store_spec.chunk_ids[0]) == chunk_id
+    assert manager.residency_generation(key) != generation
+    assert not manager.invalidate_if_unpinned(key, chunk_id, generation)
+    assert manager.lookup(key, _EMPTY_REQ_CTX) is LookupResult.HIT
+
+
 @pytest.mark.parametrize("eviction_policy", ["lru", "arc"])
 def test_already_stored_chunk_not_evicted_during_prepare_store(eviction_policy):
     """Regression test: a chunk that is already stored must not be evicted

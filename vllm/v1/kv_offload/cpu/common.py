@@ -15,6 +15,7 @@ class CPUOffloadingMetrics:
     CPU_STORE_ALLOCATION_FAILURES = "vllm:kv_offload_cpu_store_allocation_failures"
     CPU_EVICTED_CHUNKS = "vllm:kv_offload_cpu_evicted_chunks"
     CPU_MISSES_AFTER_EVICTION = "vllm:kv_offload_cpu_misses_after_eviction"
+    CPU_INVALIDATED_CHUNKS = "vllm:kv_offload_cpu_invalidated_chunks"
 
 
 class CPULoadStoreSpec(BlockIDsLoadStoreSpec):
