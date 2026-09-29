@@ -49,6 +49,7 @@ from vllm.v1.kv_offload.base import (
     OffloadingSpec,
     OffloadKey,
     OffloadPolicy,
+    PrepareStoreOutput,
     ReqContext,
     RequestOffloadingContext,
     ScheduleEndContext,
@@ -649,6 +650,49 @@ class OffloadingConnectorScheduler:
         job_id = self._job_counter
         self._job_counter += 1
         return job_id
+
+    def _prepare_store(
+        self, keys: Sequence[OffloadKey], req_context: ReqContext
+    ) -> PrepareStoreOutput | None:
+        """Count GPU-facing store offers consistently across all store paths."""
+        self._connector_stats.increase_counter(
+            _ConnectorMetricName.STORE_CHUNKS, len(keys), ("offered",)
+        )
+        start_time = time.monotonic()
+        try:
+            output = self.manager.prepare_store(keys, req_context)
+        finally:
+            self._connector_stats.observe_histogram(
+                _ConnectorMetricName.MANAGER_HOOK_DURATION,
+                time.monotonic() - start_time,
+                ("prepare_store",),
+            )
+        if output is None:
+            self._connector_stats.increase_counter(
+                _ConnectorMetricName.STORE_CHUNKS, len(keys), ("rejected_offer",)
+            )
+        else:
+            selected = len(output.keys_to_store)
+            self._connector_stats.increase_counter(
+                _ConnectorMetricName.STORE_CHUNKS, selected, ("selected",)
+            )
+            self._connector_stats.increase_counter(
+                _ConnectorMetricName.STORE_CHUNKS,
+                len(keys) - selected,
+                ("not_selected",),
+            )
+        return output
+
+    def _finish_request(self, req_context: ReqContext) -> None:
+        start_time = time.monotonic()
+        try:
+            self.manager.on_request_finished(req_context)
+        finally:
+            self._connector_stats.observe_histogram(
+                _ConnectorMetricName.MANAGER_HOOK_DURATION,
+                time.monotonic() - start_time,
+                ("request_finished",),
+            )
 
     def _remove_pending_job(self, job_id: int, block_ids: list[int] | None) -> None:
         for bid in block_ids or ():
@@ -1291,7 +1335,7 @@ class OffloadingConnectorScheduler:
                 key = self._make_boundary_key(
                     req, group_idx, boundary, req_status.req_context
                 )
-                store_output = self.manager.prepare_store([key], req_status.req_context)
+                store_output = self._prepare_store([key], req_status.req_context)
                 if store_output is None:
                     self._connector_stats.increase_counter(
                         _ConnectorMetricName.ALLOCATION_FAILURE
@@ -1398,7 +1442,7 @@ class OffloadingConnectorScheduler:
             ]
             assert all(block_id != 0 for block_id in block_ids)
 
-            store_output = self.manager.prepare_store(keys, req_status.req_context)
+            store_output = self._prepare_store(keys, req_status.req_context)
             if store_output is None:
                 self._connector_stats.increase_counter(
                     _ConnectorMetricName.ALLOCATION_FAILURE
@@ -1660,9 +1704,7 @@ class OffloadingConnectorScheduler:
                 req_status.advance_stored_idx(num_offloadable_tokens)
                 continue
 
-            store_output = self.manager.prepare_store(
-                new_offload_keys, req_status.req_context
-            )
+            store_output = self._prepare_store(new_offload_keys, req_status.req_context)
             if store_output is None:
                 self._connector_stats.increase_counter(
                     _ConnectorMetricName.ALLOCATION_FAILURE
@@ -1822,7 +1864,7 @@ class OffloadingConnectorScheduler:
             if req_status is None:
                 continue
             req_status.finished_signaled = True
-            self.manager.on_request_finished(req_status.req_context)
+            self._finish_request(req_status.req_context)
             if not req_status.transfer_jobs:
                 del self._req_status[req_id]
         self._current_batch_load_jobs = {}
@@ -1898,6 +1940,11 @@ class OffloadingConnectorScheduler:
             req_status = self._req_status[job_status.req_id]
             if job_status.is_store:
                 self.manager.complete_store(job_status.keys, req_status.req_context)
+                self._connector_stats.increase_counter(
+                    _ConnectorMetricName.STORE_CHUNKS,
+                    len(job_status.keys),
+                    ("completed",),
+                )
             else:
                 self.manager.complete_load(job_status.keys, req_status.req_context)
                 if self._chunks_being_loaded:
@@ -1954,7 +2001,7 @@ class OffloadingConnectorScheduler:
             # nothing was deferred, so finalize immediately.
             req_context = _create_req_context(request)
             self.manager.on_new_request(req_context)
-            self.manager.on_request_finished(req_context)
+            self._finish_request(req_context)
             return False, None
 
         self._maybe_observe_lookup_async_delay(req_status)
@@ -2001,7 +2048,7 @@ class OffloadingConnectorScheduler:
         for req_id, status in list(self._req_status.items()):
             if status.req.is_finished():
                 if not status.finished_signaled:
-                    self.manager.on_request_finished(status.req_context)
+                    self._finish_request(status.req_context)
                 del self._req_status[req_id]
 
         # Reset offloading manager cache

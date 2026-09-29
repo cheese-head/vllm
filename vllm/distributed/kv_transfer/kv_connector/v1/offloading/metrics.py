@@ -36,6 +36,8 @@ class _ConnectorMetricName:
     LOOKUP_SYNC_DELAY = "vllm:kv_offload_lookup_sync_delay_seconds"
     LOOKUP_ASYNC_DELAY = "vllm:kv_offload_lookup_async_delay_seconds"
     ALLOCATION_FAILURE = "vllm:kv_offload_allocation_failure"
+    STORE_CHUNKS = "vllm:kv_offload_store_chunks"
+    MANAGER_HOOK_DURATION = "vllm:kv_offload_manager_hook_duration_seconds"
 
 
 class _TransferType:
@@ -124,6 +126,38 @@ def get_connector_metric_definitions() -> dict[str, OffloadingMetricMetadata]:
         _ConnectorMetricName.ALLOCATION_FAILURE: OffloadingCounterMetadata(
             documentation=(
                 "Number of KV offload store allocation attempts that failed."
+            ),
+        ),
+        _ConnectorMetricName.STORE_CHUNKS: OffloadingCounterMetadata(
+            documentation=(
+                "GPU-to-primary store chunks at each scheduler stage. Offered "
+                "counts keys passed to prepare_store; selected counts new keys "
+                "scheduled for transfer; not_selected includes resident or "
+                "filtered keys; rejected_offer counts keys in failed calls; "
+                "completed counts keys after all workers finish."
+            ),
+            labelnames=("stage",),
+        ),
+        _ConnectorMetricName.MANAGER_HOOK_DURATION: OffloadingHistogramMetadata(
+            documentation=(
+                "Wall time in common scheduler calls into the offload manager, "
+                "in seconds. Includes cache policy and tiering wrapper work."
+            ),
+            labelnames=("hook",),
+            buckets=(
+                0.00001,
+                0.00005,
+                0.0001,
+                0.0005,
+                0.001,
+                0.005,
+                0.01,
+                0.05,
+                0.1,
+                0.5,
+                1,
+                5,
+                10,
             ),
         ),
     }

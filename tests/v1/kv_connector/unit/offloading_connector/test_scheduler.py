@@ -607,6 +607,8 @@ def test_scheduler_reports_allocation_failure(request_runner):
     # Two attempts: once while running (block becomes full during prefill),
     # once from finished_req_ids on the next step.
     assert reduced[_ConnectorMetricName.ALLOCATION_FAILURE] == 2
+    assert reduced[f"{_ConnectorMetricName.STORE_CHUNKS}:('offered',)"] == 2
+    assert reduced[f"{_ConnectorMetricName.STORE_CHUNKS}:('rejected_offer',)"] == 2
 
 
 @pytest.mark.parametrize("async_scheduling", [True, False])
@@ -2190,6 +2192,16 @@ def test_complete_store_called_per_job(request_runner, async_scheduling: bool):
     # First store: fires when block 0 is fully populated.
     runner.run(decoded_tokens=[0, 0], expected_stored=(0, 1, 2))
     assert runner.manager.complete_store.call_count == 1
+    reduced = _reduce_kv_connector_stats(runner)
+    assert reduced[f"{_ConnectorMetricName.STORE_CHUNKS}:('offered',)"] == 1
+    assert reduced[f"{_ConnectorMetricName.STORE_CHUNKS}:('selected',)"] == 1
+    assert reduced[f"{_ConnectorMetricName.STORE_CHUNKS}:('completed',)"] == 1
+    assert (
+        reduced[
+            f"{_ConnectorMetricName.MANAGER_HOOK_DURATION}:('prepare_store',)_count"
+        ]
+        == 1
+    )
     first_call_keys = set(runner.manager.complete_store.call_args.args[0])
     assert len(first_call_keys) == 1
     runner.manager.complete_store.reset_mock()

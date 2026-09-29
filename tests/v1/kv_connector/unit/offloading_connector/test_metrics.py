@@ -43,6 +43,13 @@ MY_LABEL = "my_label"
 def test_connector_metric_histogram_buckets():
     metadata = get_connector_metric_definitions()
 
+    store_chunks = metadata[_ConnectorMetricName.STORE_CHUNKS]
+    assert isinstance(store_chunks, OffloadingCounterMetadata)
+    assert store_chunks.labelnames == ("stage",)
+    manager_hook = metadata[_ConnectorMetricName.MANAGER_HOOK_DURATION]
+    assert isinstance(manager_hook, OffloadingHistogramMetadata)
+    assert manager_hook.labelnames == ("hook",)
+
     sync_delay = metadata[_ConnectorMetricName.LOOKUP_SYNC_DELAY]
     assert isinstance(sync_delay, OffloadingHistogramMetadata)
     assert sync_delay.buckets == (
