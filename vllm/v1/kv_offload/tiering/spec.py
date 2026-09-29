@@ -173,6 +173,57 @@ class TieringOffloadingSpec(CPUOffloadingSpec):
             ),
             labelnames=("tier",),
         )
+        metrics[TieringOffloadingMetrics.JOB_DURATION] = OffloadingHistogramMetadata(
+            documentation=(
+                "Wall time from secondary job creation to observed completion, "
+                "including queueing and poll delay, in seconds."
+            ),
+            labelnames=("tier", "direction", "result"),
+            buckets=(0.0001, 0.0005, 0.001, 0.005, 0.01, 0.05, 0.1, 0.5, 1, 5, 10),
+        )
+        metrics[TieringOffloadingMetrics.JOB_KEYS] = OffloadingCounterMetadata(
+            documentation="Secondary job keys by direction and outcome.",
+            labelnames=("tier", "direction", "outcome"),
+        )
+        metrics[TieringOffloadingMetrics.CASCADE_PIN_SECONDS] = (
+            OffloadingCounterMetadata(
+                documentation=(
+                    "Sum of primary chunk pin lifetimes for secondary cascade "
+                    "jobs, in chunk-seconds."
+                ),
+                labelnames=("tier",),
+            )
+        )
+        metrics[TieringOffloadingMetrics.PROMOTION_CHUNKS] = OffloadingCounterMetadata(
+            documentation="Promoted CPU chunks by later GPU use or unused eviction.",
+            labelnames=("outcome",),
+        )
+        metrics[TieringOffloadingMetrics.HOOK_DURATION] = OffloadingHistogramMetadata(
+            documentation="Tiering scheduler hook wall time in seconds.",
+            labelnames=("hook",),
+            buckets=(
+                0.00001,
+                0.00005,
+                0.0001,
+                0.0005,
+                0.001,
+                0.005,
+                0.01,
+                0.05,
+                0.1,
+                0.5,
+                1,
+            ),
+        )
+        metrics[TieringOffloadingMetrics.EVICTED_LOOKUP_OUTCOME] = (
+            OffloadingCounterMetadata(
+                documentation=(
+                    "First result per request/key after a recorded CPU eviction, "
+                    "with bounded eviction history."
+                ),
+                labelnames=("outcome",),
+            )
+        )
         metrics[TieringOffloadingMetrics.PROMOTION_JOB_FAILURES] = (
             OffloadingCounterMetadata(
                 documentation=(

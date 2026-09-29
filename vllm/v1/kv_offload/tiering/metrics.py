@@ -34,6 +34,7 @@ class _RequestMetricsState:
     observed_lookups: dict[TierLabel, dict[OffloadKey, float | None]] | None = field(
         default_factory=dict
     )
+    evicted_lookup_keys: set[OffloadKey] = field(default_factory=set)
 
 
 @dataclass
@@ -113,6 +114,12 @@ class TieringMetricsTracker:
         transfer_job = job_metadata.transfer_job
         state = self._tier_states[job_metadata.tier_idx]
         chunk_count = len(transfer_job.chunk_ids)
+        direction = "promotion" if transfer_job.is_promotion else "cascade"
+        self._stats.increase_counter(
+            TieringOffloadingMetrics.JOB_KEYS,
+            len(transfer_job.keys),
+            (*self.tier_label(job_metadata.tier_idx), direction, "submitted"),
+        )
         if transfer_job.is_promotion:
             state.active_promotion_count += 1
             state.primary_write_chunk_count += chunk_count
@@ -129,6 +136,33 @@ class TieringMetricsTracker:
     def on_promotion_allocation_failure(self) -> None:
         self._stats.increase_counter(
             TieringOffloadingMetrics.PROMOTION_ALLOCATION_FAILURES
+        )
+
+    def on_promotion_chunks(self, outcome: str, count: int) -> None:
+        if count:
+            self._stats.increase_counter(
+                TieringOffloadingMetrics.PROMOTION_CHUNKS,
+                count,
+                (outcome,),
+            )
+
+    def on_hook_duration(self, hook: str, duration: float) -> None:
+        self._stats.observe_histogram(
+            TieringOffloadingMetrics.HOOK_DURATION, duration, (hook,)
+        )
+
+    def on_evicted_lookup_outcome(
+        self, req_context: ReqContext, key: OffloadKey, outcome: str
+    ) -> None:
+        state = self._request_states.get(req_context.req_id)
+        if state is None:
+            return
+        if key in state.evicted_lookup_keys:
+            return
+        state.evicted_lookup_keys.add(key)
+        self._stats.increase_counter(
+            TieringOffloadingMetrics.EVICTED_LOOKUP_OUTCOME,
+            labelvalues=(outcome,),
         )
 
     def record_backpressure(
@@ -207,6 +241,20 @@ class TieringMetricsTracker:
     ) -> None:
         transfer_job = job_metadata.transfer_job
         labelvalues = self.tier_label(job_metadata.tier_idx)
+        elapsed = max(0.0, time.monotonic() - transfer_job.submit_time)
+        direction = "promotion" if transfer_job.is_promotion else "cascade"
+        result = "success" if completed_job.success else "failure"
+        self._stats.observe_histogram(
+            TieringOffloadingMetrics.JOB_DURATION,
+            elapsed,
+            (*labelvalues, direction, result),
+        )
+        if not transfer_job.is_promotion:
+            self._stats.increase_counter(
+                TieringOffloadingMetrics.CASCADE_PIN_SECONDS,
+                elapsed * len(transfer_job.chunk_ids),
+                labelvalues,
+            )
         completed_key_count = len(transfer_job.keys)
         if not completed_job.success:
             failure_metric = (
@@ -218,7 +266,24 @@ class TieringMetricsTracker:
             if transfer_job.is_promotion and completed_job.successful_keys:
                 completed_key_count = len(completed_job.successful_keys)
             else:
+                self._stats.increase_counter(
+                    TieringOffloadingMetrics.JOB_KEYS,
+                    completed_key_count,
+                    (*labelvalues, direction, "failed_or_unknown"),
+                )
                 return
+
+        self._stats.increase_counter(
+            TieringOffloadingMetrics.JOB_KEYS,
+            completed_key_count,
+            (*labelvalues, direction, "succeeded"),
+        )
+        if completed_key_count < len(transfer_job.keys):
+            self._stats.increase_counter(
+                TieringOffloadingMetrics.JOB_KEYS,
+                len(transfer_job.keys) - completed_key_count,
+                (*labelvalues, direction, "failed_or_unknown"),
+            )
 
         bytes_metric = (
             TieringOffloadingMetrics.READ_BYTES

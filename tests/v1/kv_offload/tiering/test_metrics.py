@@ -143,6 +143,24 @@ def test_tiering_metrics_tracker_records_finished_job_metrics():
     assert values[TieringOffloadingMetrics.READ_TIME][label] == 0.25
     assert values[TieringOffloadingMetrics.CASCADE_JOB_FAILURES][label] == 1
     assert values[TieringOffloadingMetrics.PROMOTION_JOB_FAILURES][label] == 1
+    assert (
+        values[TieringOffloadingMetrics.JOB_KEYS][(*label, "cascade", "submitted")] == 2
+    )
+    assert (
+        values[TieringOffloadingMetrics.JOB_KEYS][(*label, "promotion", "submitted")]
+        == 2
+    )
+    assert (
+        values[TieringOffloadingMetrics.JOB_KEYS][
+            (*label, "cascade", "failed_or_unknown")
+        ]
+        == 1
+    )
+    assert (
+        values[TieringOffloadingMetrics.JOB_DURATION][(*label, "cascade", "failure")][0]
+        >= 0
+    )
+    assert values[TieringOffloadingMetrics.CASCADE_PIN_SECONDS][label] >= 0
     tracker.assert_idle()
 
 
@@ -176,6 +194,16 @@ def test_tiering_metrics_tracker_records_partial_promotion_success_bytes():
     assert values[TieringOffloadingMetrics.READ_BYTES][label] == 32
     assert values[TieringOffloadingMetrics.READ_TIME][label] == 0.5
     assert values[TieringOffloadingMetrics.PROMOTION_JOB_FAILURES][label] == 1
+    assert (
+        values[TieringOffloadingMetrics.JOB_KEYS][(*label, "promotion", "succeeded")]
+        == 2
+    )
+    assert (
+        values[TieringOffloadingMetrics.JOB_KEYS][
+            (*label, "promotion", "failed_or_unknown")
+        ]
+        == 1
+    )
     tracker.assert_idle()
 
 
@@ -224,3 +252,21 @@ def test_tiering_metrics_tracker_records_promotion_allocation_failures():
     assert stats is not None
     values = stats.data["data"]
     assert values[TieringOffloadingMetrics.PROMOTION_ALLOCATION_FAILURES][()] == 1
+
+
+def test_tiering_metrics_tracker_deduplicates_evicted_lookup_outcomes():
+    tracker = TieringMetricsTracker(
+        tier_types=[], num_primary_chunks=2, primary_chunk_size=16
+    )
+    key = to_keys([1])[0]
+    tracker.on_new_request(_CTX)
+    tracker.on_evicted_lookup_outcome(_CTX, key, "all_tiers_miss")
+    tracker.on_evicted_lookup_outcome(_CTX, key, "all_tiers_miss")
+    stats = tracker.take_stats()
+    assert stats is not None
+    assert (
+        stats.data["data"][TieringOffloadingMetrics.EVICTED_LOOKUP_OUTCOME][
+            ("all_tiers_miss",)
+        ]
+        == 1
+    )

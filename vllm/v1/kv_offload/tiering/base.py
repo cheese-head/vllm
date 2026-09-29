@@ -61,6 +61,12 @@ class TieringOffloadingMetrics:
     )
     BACKPRESSURE_STORES_DROPPED = "vllm:kv_offload_tiering_backpressure_stores_dropped"
     BACKPRESSURE_BLOCKS_DROPPED = "vllm:kv_offload_tiering_backpressure_blocks_dropped"
+    JOB_DURATION = "vllm:kv_offload_tiering_job_duration_seconds"
+    JOB_KEYS = "vllm:kv_offload_tiering_job_keys"
+    CASCADE_PIN_SECONDS = "vllm:kv_offload_tiering_cascade_pin_seconds"
+    PROMOTION_CHUNKS = "vllm:kv_offload_tiering_promotion_chunks"
+    HOOK_DURATION = "vllm:kv_offload_tiering_hook_duration_seconds"
+    EVICTED_LOOKUP_OUTCOME = "vllm:kv_offload_tiering_evicted_lookup_outcome"
 
 
 @dataclass

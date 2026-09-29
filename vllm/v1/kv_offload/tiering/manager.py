@@ -209,6 +209,7 @@ class TieringOffloadingManager(OffloadingManager):
         #   True:  secondary → primary (promotion)
         #   False: primary → secondary (cascade)
         self._jobs: dict[JobId, JobMetadata] = {}
+        self._promoted_unused: set[OffloadKey] = set()
         primary_view = self.primary_tier.get_kv_memoryview()
         assert primary_view.strides is not None
         self._metrics = TieringMetricsTracker(
@@ -299,6 +300,8 @@ class TieringOffloadingManager(OffloadingManager):
                 transfer_job.req_context,
                 True,
             )
+            self._promoted_unused.update(successful_keys)
+            self._metrics.on_promotion_chunks("completed", len(successful_keys))
         if failed_keys:
             self.primary_tier.complete_write(
                 failed_keys,
@@ -316,6 +319,7 @@ class TieringOffloadingManager(OffloadingManager):
         3. For completed loads (secondary→primary): calls primary.complete_write()
            to make chunks available
         """
+        start_time = time.monotonic()
         for i, tier in enumerate(self.secondary_tiers):
             for completed_job in tier.get_finished_jobs():
                 job_id = completed_job.job_id
@@ -343,6 +347,7 @@ class TieringOffloadingManager(OffloadingManager):
                     )
                     if completed_job.success:
                         self._update_backpressure(tier, job_metadata, completed_job)
+        self._metrics.on_hook_duration("completion_poll", time.monotonic() - start_time)
 
     def _should_store_to_tier(
         self, tier: SecondaryTierManager, num_blocks: int
@@ -430,6 +435,7 @@ class TieringOffloadingManager(OffloadingManager):
         if primary_hit is LookupResult.HIT_PENDING:
             return LookupResult.HIT_PENDING
 
+        primary_was_evicted = self.primary_tier.was_recently_evicted(key)
         any_retry = False
         for i, tier in enumerate(self.secondary_tiers):
             if i == exclude_tier_idx:
@@ -449,6 +455,12 @@ class TieringOffloadingManager(OffloadingManager):
                     lookup_duration,
                 )
                 promoted = self._initiate_promotion(i, key, req_context)
+                if primary_was_evicted:
+                    self._metrics.on_evicted_lookup_outcome(
+                        req_context,
+                        key,
+                        "promotion_started" if promoted else "promotion_blocked",
+                    )
                 return LookupResult.MISS if not promoted else LookupResult.HIT_PENDING
             if result is LookupResult.RETRY:
                 any_retry = True
@@ -462,6 +474,8 @@ class TieringOffloadingManager(OffloadingManager):
 
         if any_retry:
             return LookupResult.RETRY
+        if primary_was_evicted:
+            self._metrics.on_evicted_lookup_outcome(req_context, key, "all_tiers_miss")
         return LookupResult.MISS
 
     def _initiate_promotion(
@@ -498,6 +512,8 @@ class TieringOffloadingManager(OffloadingManager):
             # rather than retrying indefinitely.
             self._metrics.on_promotion_allocation_failure()
             return False
+
+        self._record_unused_promotion_evictions(primary_write_result.evicted_keys)
 
         store_spec = primary_write_result.store_spec
         assert isinstance(store_spec, CPULoadStoreSpec)
@@ -559,7 +575,18 @@ class TieringOffloadingManager(OffloadingManager):
             LoadStoreSpec for reading from primary tier.
 
         """
-        return self.primary_tier.prepare_load(keys, req_context)
+        used = self._promoted_unused.intersection(keys)
+        result = self.primary_tier.prepare_load(keys, req_context)
+        self._promoted_unused.difference_update(used)
+        self._metrics.on_promotion_chunks("gpu_loaded", len(used))
+        return result
+
+    def _record_unused_promotion_evictions(
+        self, evicted_keys: Collection[OffloadKey]
+    ) -> None:
+        unused = self._promoted_unused.intersection(evicted_keys)
+        self._promoted_unused.difference_update(unused)
+        self._metrics.on_promotion_chunks("evicted_unused", len(unused))
 
     @override
     def touch(self, keys: Collection[OffloadKey], req_context: ReqContext):
@@ -630,6 +657,8 @@ class TieringOffloadingManager(OffloadingManager):
 
         if primary_result is None:
             return None
+
+        self._record_unused_promotion_evictions(primary_result.evicted_keys)
 
         if primary_result.keys_to_store:
             state = self._req_state[req_context.req_id]
@@ -861,6 +890,7 @@ class TieringOffloadingManager(OffloadingManager):
         # Catch-all poll: guarantees jobs are processed even on steps where
         # lookup()/prepare_store() were never called (e.g. no requests
         # scheduled but a tier still has_pending_work()).
+        start_time = time.monotonic()
         self._maybe_process_finished_jobs()
 
         for tier in self.secondary_tiers:
@@ -880,6 +910,7 @@ class TieringOffloadingManager(OffloadingManager):
             if state is None:
                 continue
             self._metrics.on_request_allocated(state.req_context)
+        self._metrics.on_hook_duration("schedule_end", time.monotonic() - start_time)
 
     @override
     def has_pending_work(self) -> bool:
@@ -944,6 +975,7 @@ class TieringOffloadingManager(OffloadingManager):
             finished_req_ids.append(req_id)
 
         self.primary_tier.reset_cache()
+        self._promoted_unused.clear()
 
         for req_id in finished_req_ids:
             del self._req_state[req_id]
