@@ -457,6 +457,47 @@ def test_create_next_worker_view_worker_isolation(iid):
         del raw, t0, t1  # release before finally triggers cleanup
 
 
+def test_scheduler_numa_population_uses_each_worker_slice(iid, monkeypatch):
+    active_node: list[int] = []
+    calls: list[tuple[int, int, int]] = []
+
+    @contextlib.contextmanager
+    def bind(node: int):
+        active_node.append(node)
+        try:
+            yield
+        finally:
+            active_node.pop()
+
+    def select_populator(_mapping):
+        assert active_node == [0]
+
+        def populate(_mapping, offset: int, length: int):
+            calls.append((active_node[0], offset, length))
+
+        return populate
+
+    monkeypatch.setattr(region_module, "bind_memory_to_node", bind)
+    monkeypatch.setattr(region_module, "_get_populate_write_fn", select_populator)
+    region = SharedOffloadRegion(
+        engine_id=iid,
+        num_chunks=2,
+        rank=None,
+        kv_bytes_per_chunk=2 * PAGE_SIZE,
+        cpu_page_size=PAGE_SIZE,
+        numa_nodes=[0, 1],
+    )
+    try:
+        assert calls == [
+            (0, 0, PAGE_SIZE),
+            (0, 2 * PAGE_SIZE, PAGE_SIZE),
+            (1, PAGE_SIZE, PAGE_SIZE),
+            (1, 3 * PAGE_SIZE, PAGE_SIZE),
+        ]
+    finally:
+        region.cleanup()
+
+
 # ---------------------------------------------------------------------------
 # Constructor — creator vs joiner semantics
 # ---------------------------------------------------------------------------

@@ -15,6 +15,7 @@ from vllm.distributed.device_communicators.shm_broadcast import (
 )
 from vllm.logger import init_logger
 from vllm.platforms import current_platform
+from vllm.v1.kv_offload.cpu.numa import bind_memory_to_node
 
 logger = init_logger(__name__)
 
@@ -97,9 +98,12 @@ class SharedOffloadRegion:
         *,
         creator_memory_check: Callable[[int], None] | None = None,
         populate_only_on_creator: bool = False,
+        numa_nodes: list[int] | None = None,
     ) -> None:
         if populate_only_on_creator and barrier is None:
             raise ValueError("Creator-only population requires a barrier.")
+        if numa_nodes is not None and (rank is not None or populate_only_on_creator):
+            raise ValueError("NUMA population requires a scheduler-side region")
         self.page_size = mmap.PAGESIZE
         assert kv_bytes_per_chunk % self.page_size == 0
 
@@ -210,6 +214,14 @@ class SharedOffloadRegion:
         if populate_only_on_creator:
             return
 
+        if numa_nodes is not None:
+            try:
+                self._populate_numa_slices(cpu_page_size, numa_nodes)
+            except Exception:
+                self.cleanup()
+                raise
+            return
+
         populate_write_fn = _get_populate_write_fn(self.mmap_obj)
 
         if rank is not None:
@@ -235,6 +247,26 @@ class SharedOffloadRegion:
             logger.debug(
                 "MADV_POPULATE_WRITE entire region: %.3f s", time.perf_counter() - _t0
             )
+
+    def _populate_numa_slices(self, cpu_page_size: int, nodes: list[int]) -> None:
+        if cpu_page_size % self.page_size:
+            raise ValueError("NUMA worker slice must be page-aligned")
+        if cpu_page_size * len(nodes) > self._row_stride:
+            raise ValueError("NUMA worker slices exceed the CPU offload row")
+        assert self.mmap_obj is not None
+        # The method probe itself touches page zero, so run it under the
+        # first worker's policy before faulting any part of the region.
+        with bind_memory_to_node(nodes[0]):
+            populate_write_fn = _get_populate_write_fn(self.mmap_obj)
+        for rank, node in enumerate(nodes):
+            offset_in_row = rank * cpu_page_size
+            length = cpu_page_size
+            if rank == len(nodes) - 1:
+                length = self._row_stride - offset_in_row
+            with bind_memory_to_node(node):
+                for chunk in range(self.num_chunks):
+                    offset = chunk * self._row_stride + offset_in_row
+                    populate_write_fn(self.mmap_obj, offset, length)
 
     @property
     def base_tensor(self) -> torch.Tensor:

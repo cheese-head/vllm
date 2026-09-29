@@ -52,6 +52,7 @@ Example out-of-tree tier configuration:
 }
 """
 
+import mmap
 from typing import Any
 
 import torch
@@ -68,6 +69,7 @@ from vllm.v1.kv_offload.base import (
 )
 from vllm.v1.kv_offload.config import OffloadingConfig
 from vllm.v1.kv_offload.cpu.gpu_worker import CPUOffloadingWorker
+from vllm.v1.kv_offload.cpu.numa import validate_numa_nodes
 from vllm.v1.kv_offload.cpu.shared_offload_region import SharedOffloadRegion
 from vllm.v1.kv_offload.cpu.spec import CPUOffloadingSpec
 from vllm.v1.kv_offload.tiering.base import TieringOffloadingMetrics
@@ -93,6 +95,48 @@ class TieringOffloadingSpec(CPUOffloadingSpec):
     """
 
     BLOCK_SIZE_ALIGNMENT = SharedOffloadRegion.BLOCK_SIZE_ALIGNMENT
+
+    def _primary_numa_nodes(self) -> list[int] | None:
+        placement = self.extra_config.get("cpu_numa_nodes")
+        if placement is None:
+            return None
+        if self.config.canonical_layout or self.replicated_layout:
+            raise ValueError(
+                "cpu_numa_nodes requires non-canonical, non-replicated layout"
+            )
+        if self.cpu_page_size_per_worker % mmap.PAGESIZE:
+            raise ValueError("cpu_numa_nodes requires page-aligned worker slices")
+        world_size = self.config.parallel.world_size
+        if placement == "auto":
+            from vllm.platforms import current_platform
+
+            device_nodes = current_platform.get_all_device_numa_nodes()
+            if not device_nodes:
+                raise ValueError("Could not detect NUMA nodes for visible GPUs")
+            nodes: list[int | None] = [None] * world_size
+            for device_idx, node in enumerate(device_nodes):
+                rank = device_idx % world_size
+                if nodes[rank] is not None and nodes[rank] != node:
+                    raise ValueError(
+                        "GPU devices mapped to one offload slot have different "
+                        "NUMA nodes; provide cpu_numa_nodes explicitly"
+                    )
+                nodes[rank] = node
+            if any(node is None for node in nodes):
+                raise ValueError("Could not map every offload slot to a NUMA node")
+            resolved = [int(node) for node in nodes if node is not None]
+        elif (
+            isinstance(placement, list)
+            and len(placement) == world_size
+            and all(type(node) is int for node in placement)
+        ):
+            resolved = placement
+        else:
+            raise ValueError(
+                "cpu_numa_nodes must be 'auto' or one integer node per worker slot"
+            )
+        validate_numa_nodes(resolved)
+        return resolved
 
     @classmethod
     @override
@@ -407,6 +451,7 @@ class TieringOffloadingSpec(CPUOffloadingSpec):
                     rank=None,
                     kv_bytes_per_chunk=self.kv_bytes_per_chunk,
                     cpu_page_size=self.cpu_page_size_per_worker,
+                    numa_nodes=self._primary_numa_nodes(),
                 )
                 self._scheduler_mmap = scheduler_mmap
 
