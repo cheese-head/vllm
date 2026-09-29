@@ -2,11 +2,12 @@
 
 This plan is grounded in vLLM `2840ca7a33` and KVCR `317e62f`. The four
 `perf-gap/01-*` through `perf-gap/04-*` branches contain measurement changes.
-The stages below describe **future implementation work**; none of the NUMA,
-eviction-policy, or write-policy behavior is implemented by those branches.
-Keep each stage as one reviewable commit or a short series on its own local
-branch. Cherry-pick in dependency order. Do not reset the live cache to make
-comparisons; the benchmark operator owns workload runs.
+Optional implementations for Stages 2 through 6 now live in separate commits
+on `perf-gap/05-*` through `perf-gap/09-*`. Stage 1's startup and page location
+probes are still pending. The implementations have static checks but have not
+been run with vLLM/KVCR or GPUs on the target host. Cherry-pick in the order
+below; each branch tip includes its predecessors. Do not reset the live cache
+to make comparisons; the benchmark operator owns workload runs.
 
 ## Why this order
 
@@ -28,7 +29,7 @@ placement comparison.
 
 ## Stage 1: NUMA evidence and safe startup ordering
 
-Suggested branch: `perf-gap/05-numa-placement-probe`.
+Pending branch: `perf-gap/numa-placement-probe`.
 
 Add bounded startup diagnostics for the actual EngineCore and worker CPU
 affinity, GPU physical index and NUMA node, cpuset-allowed memory nodes,
@@ -47,7 +48,7 @@ matches, profile wrapper and scheduler time before changing NUMA policy.
 
 ## Stage 2: optional NUMA placement for the CPU primary
 
-Suggested branch: `perf-gap/06-numa-primary`.
+Implemented branch: `perf-gap/05-numa-primary`.
 
 Add a default-off option in `kv_connector_extra_config` for the ordinary
 non-canonical, non-replicated layout. Map physical accelerator indices to
@@ -73,7 +74,7 @@ GPU-to-CPU and CPU-to-GPU byte/time distributions on local and remote nodes.
 
 ## Stage 3: lineage-aware CPU eviction, only if the trace supports it
 
-Suggested branch: `perf-gap/07-lineage-eviction`.
+Implemented branch: `perf-gap/06-lineage-eviction`.
 
 First collect a bounded, sampled event trace of parent/child offload chunk
 keys, CPU admission/removal, and subsequent lookup outcomes. Existing
@@ -100,7 +101,7 @@ later hit, promotion, and recomputation outcomes.
 
 ## Stage 4: explicit tracked asynchronous write-through
 
-Suggested branch: `perf-gap/08-write-through`.
+Implemented branch: `perf-gap/07-tracked-write-through`.
 
 Add a per-secondary policy setting whose default preserves today's
 best-effort eager cascade. For the new tracked policy, record per-key,
@@ -121,7 +122,7 @@ decisions; the first implementation is asynchronous and opportunistic.
 
 ## Stage 5: write-back with eviction reservation
 
-Suggested branch: `perf-gap/09-write-back`.
+Implemented branch: `perf-gap/08-write-back`.
 
 Add a two-stage primary eviction reservation. A key lacking confirmed
 lower-tier residency cannot lose its last valid copy: reserve and pin its
@@ -138,7 +139,7 @@ duration, and TTFT tails against the eager and tracked write-through modes.
 
 ## Stage 6: write-through with primary invalidation
 
-Suggested branch: `perf-gap/10-write-through-invalidate`.
+Implemented branch: `perf-gap/09-write-through-invalidate`.
 
 Add `invalidate_if_unpinned(key, generation)` to the CPU primary. After a
 confirmed lower-tier deposit, retire exactly that primary residency only
@@ -160,7 +161,8 @@ no-secondary gap is explained. Each branch should carry its own tests and
 metric deltas; model-affecting changes also need output validation and model
 evaluations by the operator.
 
-The proposed implementation branches do not yet exist. Stage 1 may show
-that a non-NUMA cause dominates, and Stage 3 is conditional on lineage
-evidence. Do not create empty feature branches or claim a policy is
-implemented until its code and tests are present.
+Stage 1 may show that a non-NUMA cause dominates; the NUMA option should stay
+off until page placement is verified on the target host. The lineage policy
+should likewise stay off until traces show that stranded descendants matter.
+The policy code is available for review and cherry-picking, but runtime
+correctness and performance remain to be established on a full vLLM/KVCR host.
