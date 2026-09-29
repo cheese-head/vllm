@@ -67,8 +67,8 @@ class CPUOffloadingSpec(OffloadingSpec):
             CPUOffloadingMetrics.CPU_CACHE_READ_USAGE_PERC: OffloadingGaugeMetadata(
                 documentation=(
                     "Fraction of CPU KV-cache space currently pinned by "
-                    "in-flight loads that have not yet "
-                    "completed (0.0 = idle, 1.0 = saturated)."
+                    "reads that have not yet completed; in tiering this "
+                    "includes secondary cascades (0.0 = idle, 1.0 = saturated)."
                 ),
             ),
             CPUOffloadingMetrics.CPU_ALLOCATION_SIZE: OffloadingHistogramMetadata(
@@ -77,6 +77,26 @@ class CPUOffloadingSpec(OffloadingSpec):
                     "KV offload prepare_store call."
                 ),
                 buckets=(1, 4, 16, 64, 256, 1024, 4096, 16384, 65536, 262144),
+            ),
+            CPUOffloadingMetrics.CPU_CACHE_SLOTS: OffloadingGaugeMetadata(
+                documentation="CPU cache slot counts by state.",
+                labelnames=("state",),
+            ),
+            CPUOffloadingMetrics.CPU_STORE_ALLOCATION_FAILURES: (
+                OffloadingCounterMetadata(
+                    documentation="CPU prepare_store calls unable to allocate slots."
+                )
+            ),
+            CPUOffloadingMetrics.CPU_EVICTED_CHUNKS: OffloadingCounterMetadata(
+                documentation="CPU cache chunks evicted to admit new chunks."
+            ),
+            CPUOffloadingMetrics.CPU_MISSES_AFTER_EVICTION: (
+                OffloadingCounterMetadata(
+                    documentation=(
+                        "Distinct request/key CPU lookup misses after a recorded "
+                        "eviction of that key. History is bounded to 64000 keys."
+                    ),
+                )
             ),
         }
         store_threshold = int(extra_config.get("store_threshold", 0))

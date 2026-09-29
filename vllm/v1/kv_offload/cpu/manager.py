@@ -40,6 +40,7 @@ class _RequestCacheAccess:
     inserted_keys: set[OffloadKey] = field(default_factory=set)
     reused_keys: set[OffloadKey] = field(default_factory=set)
     store_miss_keys: set[OffloadKey] = field(default_factory=set)
+    eviction_miss_keys: set[OffloadKey] = field(default_factory=set)
     finished: bool = False
 
 
@@ -76,6 +77,12 @@ class CPUOffloadingManager(OffloadingManager):
         self._num_evictable_cache_chunks: int = 0
         # Track chunks with an in-flight store (ref_cnt -1, not yet completed).
         self._num_write_pending_chunks: int = 0
+        self._store_allocation_failures = 0
+        self._evicted_chunks = 0
+        # Exact, bounded evidence that a key was previously resident here.
+        self._recent_evictions: OrderedDict[OffloadKey, None] = OrderedDict()
+        self._max_recent_evictions = 64_000
+        self._misses_after_eviction = 0
 
         self.store_threshold: int = store_threshold
         self.max_tracker_size: int = max_tracker_size
@@ -188,10 +195,19 @@ class CPUOffloadingManager(OffloadingManager):
     def lookup(self, key: OffloadKey, req_context: ReqContext) -> LookupResult:
         chunk = self._policy.get(key)
         if chunk is None:
+            if key in self._recent_evictions:
+                state = self._get_request_cache_access(req_context)
+                if key not in state.eviction_miss_keys:
+                    state.eviction_miss_keys.add(key)
+                    self._misses_after_eviction += 1
             return LookupResult.MISS
         if not chunk.is_ready:
             return LookupResult.HIT_PENDING
         return LookupResult.HIT
+
+    def was_recently_evicted(self, key: OffloadKey) -> bool:
+        """Whether this exact key is in the bounded CPU eviction history."""
+        return key in self._recent_evictions
 
     @override
     def prepare_load(
@@ -307,6 +323,7 @@ class CPUOffloadingManager(OffloadingManager):
         if num_chunks_to_evict > 0:
             if num_chunks_to_evict > self._num_evictable_cache_chunks:
                 # Eviction will fail.
+                self._store_allocation_failures += 1
                 return None
             # There is a still a chance for eviction failure as some of the
             # idle chunks might be in the protected list.
@@ -316,6 +333,7 @@ class CPUOffloadingManager(OffloadingManager):
             protected = set(keys)
             evicted = self._policy.evict(num_chunks_to_evict, protected)
             if evicted is None:
+                self._store_allocation_failures += 1
                 return None
 
             # cache-policy removes only idle chunks.
@@ -325,6 +343,11 @@ class CPUOffloadingManager(OffloadingManager):
             for key, chunk in evicted:
                 self._free_chunk(chunk)
                 to_evict.append(key)
+                self._recent_evictions[key] = None
+                self._recent_evictions.move_to_end(key)
+                if len(self._recent_evictions) > self._max_recent_evictions:
+                    self._recent_evictions.popitem(last=False)
+            self._evicted_chunks += len(evicted)
 
         if to_evict and self.events is not None:
             self.events.append(
@@ -342,6 +365,7 @@ class CPUOffloadingManager(OffloadingManager):
 
         for key, chunk in zip(keys_to_store, chunks):
             self._policy.insert(key, chunk)
+            self._recent_evictions.pop(key, None)
         self._num_write_pending_chunks += len(keys_to_store)
         state.inserted_keys.update(keys_to_store)
 
@@ -432,6 +456,7 @@ class CPUOffloadingManager(OffloadingManager):
 
         self._free_list.clear()
         self._num_allocated_chunks = 0
+        self._recent_evictions.clear()
 
     @override
     def take_events(self) -> Iterable[OffloadingEvent]:
@@ -441,6 +466,38 @@ class CPUOffloadingManager(OffloadingManager):
 
     def get_stats(self) -> OffloadingConnectorStats | None:
         stats = OffloadingConnectorStats()
+
+        free = self._get_num_free_chunks()
+        resident = self._num_allocated_chunks - len(self._free_list)
+        for state, count in (
+            ("free", free),
+            ("evictable", self._num_evictable_cache_chunks),
+            ("write_pending", self._num_write_pending_chunks),
+            (
+                "read_pinned",
+                resident
+                - self._num_evictable_cache_chunks
+                - self._num_write_pending_chunks,
+            ),
+        ):
+            stats.set_gauge(CPUOffloadingMetrics.CPU_CACHE_SLOTS, count, (state,))
+        if self._store_allocation_failures:
+            stats.increase_counter(
+                CPUOffloadingMetrics.CPU_STORE_ALLOCATION_FAILURES,
+                self._store_allocation_failures,
+            )
+            self._store_allocation_failures = 0
+        if self._evicted_chunks:
+            stats.increase_counter(
+                CPUOffloadingMetrics.CPU_EVICTED_CHUNKS, self._evicted_chunks
+            )
+            self._evicted_chunks = 0
+        if self._misses_after_eviction:
+            stats.increase_counter(
+                CPUOffloadingMetrics.CPU_MISSES_AFTER_EVICTION,
+                self._misses_after_eviction,
+            )
+            self._misses_after_eviction = 0
 
         # Compute cache usage.
         num_used = (

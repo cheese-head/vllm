@@ -273,6 +273,42 @@ def test_cpu_manager_reports_cache_usage_gauge():
     check_usage_stats(manager, 0.0)
 
 
+def test_cpu_manager_reports_slot_pressure_and_evictions():
+    manager = make_cpu_manager(num_chunks=2)
+    manager.prepare_store(to_keys([1]), _EMPTY_REQ_CTX)
+    manager.complete_store(to_keys([1]), _EMPTY_REQ_CTX)
+    manager.prepare_load(to_keys([1]), _EMPTY_REQ_CTX)
+    manager.prepare_store(to_keys([2]), _EMPTY_REQ_CTX)
+    assert manager.prepare_store(to_keys([3]), _EMPTY_REQ_CTX) is None
+
+    stats = manager.get_stats()
+    assert stats is not None
+    slots = stats.data["data"][CPUOffloadingMetrics.CPU_CACHE_SLOTS]
+    assert slots == {
+        ("free",): 0,
+        ("evictable",): 0,
+        ("write_pending",): 1,
+        ("read_pinned",): 1,
+    }
+    assert stats.reduce()[CPUOffloadingMetrics.CPU_STORE_ALLOCATION_FAILURES] == 1
+
+    manager.complete_load(to_keys([1]), _EMPTY_REQ_CTX)
+    manager.complete_store(to_keys([2]), _EMPTY_REQ_CTX)
+    result = manager.prepare_store(to_keys([3]), _EMPTY_REQ_CTX)
+    assert result is not None
+    assert len(result.evicted_keys) == 1
+    stats = manager.get_stats()
+    assert stats is not None
+    assert stats.reduce()[CPUOffloadingMetrics.CPU_EVICTED_CHUNKS] == 1
+
+    evicted_key = result.evicted_keys[0]
+    assert manager.lookup(evicted_key, _EMPTY_REQ_CTX) is LookupResult.MISS
+    assert manager.lookup(evicted_key, _EMPTY_REQ_CTX) is LookupResult.MISS
+    stats = manager.get_stats()
+    assert stats is not None
+    assert stats.reduce()[CPUOffloadingMetrics.CPU_MISSES_AFTER_EVICTION] == 1
+
+
 def test_cpu_manager_reports_allocation_size_histogram():
     manager = make_cpu_manager(num_chunks=4, cache_policy="lru")
 
