@@ -68,6 +68,7 @@ class TieringOffloadingMetrics:
     HOOK_DURATION = "vllm:kv_offload_tiering_hook_duration_seconds"
     EVICTED_LOOKUP_OUTCOME = "vllm:kv_offload_tiering_evicted_lookup_outcome"
     WRITE_POLICY_KEYS = "vllm:kv_offload_tiering_write_policy_keys"
+    WRITEBACK_CLAIMS = "vllm:kv_offload_tiering_writeback_claims"
 
 
 @dataclass
@@ -79,6 +80,7 @@ class TransferJob:
     chunk_ids: np.ndarray
     is_promotion: bool
     req_context: ReqContext
+    claim_residency: bool = field(default=False, kw_only=True)
     submit_time: float = field(default_factory=time.monotonic)
 
 
@@ -95,6 +97,7 @@ class JobResult:
     successful_keys: Collection[OffloadKey] | None = None
     transfer_time: float | None = None
     transfer_bytes: int | None = None
+    residency_claims: dict[OffloadKey, object] | None = None
 
 
 class ParentManager(ABC):
@@ -148,6 +151,11 @@ class SecondaryTierManager(ABC):
     """
 
     medium: ClassVar[Medium | None] = None
+    supports_residency_claims: ClassVar[bool] = False
+
+    def release_residency_claims(self, handles: Collection[object]) -> None:
+        if handles:
+            raise NotImplementedError("This tier cannot release residency claims")
 
     def __init__(
         self,

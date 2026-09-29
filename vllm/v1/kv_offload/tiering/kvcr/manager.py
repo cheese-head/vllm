@@ -263,12 +263,15 @@ class _VllmKeyAdapter:
         return maybe_convert_block_hash(block_hash)
 
 
-# Job ID, remaining blocks, aggregate success, and successful load keys.
-_JobState = tuple[int, int, bool, set[OffloadKey], bool]
+# Job ID, remaining blocks, success, successful keys, promotion flag,
+# claim request, and KVCR release handles.
+_JobState = tuple[int, int, bool, set[OffloadKey], bool, bool, dict[OffloadKey, object]]
 
 
 class KVCRSecondaryTierManager(SecondaryTierManager):
     """Secondary tier wrapper around the KVCR KV P2P API."""
+
+    supports_residency_claims = True
 
     @classmethod
     @override
@@ -493,6 +496,8 @@ class KVCRSecondaryTierManager(SecondaryTierManager):
             True,
             set(),
             True,
+            False,
+            {},
         )
 
     @override
@@ -508,14 +513,27 @@ class KVCRSecondaryTierManager(SecondaryTierManager):
                 JobResult(job_id=job_metadata.job_id, success=True)
             )
             return
-        op_handle = self._kvcr.deposit(blocks)
+        op_handle = (
+            self._kvcr.deposit(blocks, no_evict=True)
+            if job_metadata.claim_residency
+            else self._kvcr.deposit(blocks)
+        )
         self._jobs_by_op[op_handle] = (
             job_metadata.job_id,
             len(blocks),
             True,
             set(),
             False,
+            job_metadata.claim_residency,
+            {},
         )
+
+    @override
+    def release_residency_claims(self, handles: Collection[object]) -> None:
+        if handles:
+            results = self._kvcr.release(handles)
+            if not all(success for _, success in results):
+                raise RuntimeError("KVCR failed to release a residency claim")
 
     @override
     def get_finished_jobs(self) -> Iterable[JobResult]:
@@ -550,7 +568,15 @@ class KVCRSecondaryTierManager(SecondaryTierManager):
             job_state = self._jobs_by_op.get(op_handle)
             if job_state is None:
                 continue
-            job_id, remaining, success, successful_keys, is_promotion = job_state
+            (
+                job_id,
+                remaining,
+                success,
+                successful_keys,
+                is_promotion,
+                claim_residency,
+                claims,
+            ) = job_state
             if self._enable_telemetry:
                 operation = "deliver" if is_promotion else "deposit"
                 for entry in entries.values():
@@ -559,12 +585,25 @@ class KVCRSecondaryTierManager(SecondaryTierManager):
                         labelvalues=(operation, entry.status.value.lower()),
                     )
             remaining -= len(entries)
-            success = success and all(entry.success for entry in entries.values())
+            entry_success = {
+                key: entry.success
+                and (not claim_residency or entry.release_handle is not None)
+                for key, entry in entries.items()
+            }
+            success = success and all(entry_success.values())
             successful_keys.update(
                 OffloadKey(bytes(key))
-                for key, entry in entries.items()
-                if entry.success
+                for key, succeeded in entry_success.items()
+                if succeeded
             )
+            if claim_residency:
+                claims.update(
+                    {
+                        OffloadKey(bytes(key)): entry.release_handle
+                        for key, entry in entries.items()
+                        if entry_success[key] and entry.release_handle is not None
+                    }
+                )
             if remaining > 0:
                 self._jobs_by_op[op_handle] = (
                     job_id,
@@ -572,6 +611,8 @@ class KVCRSecondaryTierManager(SecondaryTierManager):
                     success,
                     successful_keys,
                     is_promotion,
+                    claim_residency,
+                    claims,
                 )
                 continue
             self._jobs_by_op.pop(op_handle, None)
@@ -582,6 +623,7 @@ class KVCRSecondaryTierManager(SecondaryTierManager):
                     successful_keys=successful_keys
                     if not success and successful_keys
                     else None,
+                    residency_claims=claims if claims else None,
                 )
             )
         results.extend(self._framework_pin_adapter.take_pin_job_results())

@@ -212,6 +212,15 @@ class TieringOffloadingManager(OffloadingManager):
         self._store_status: list[dict[OffloadKey, str]] = [
             {} for _ in self.secondary_tiers
         ]
+        self._residency_claims: list[dict[OffloadKey, object]] = [
+            {} for _ in self.secondary_tiers
+        ]
+        for index, policy in enumerate(self._write_policies):
+            if (
+                policy == "write_back"
+                and not self.secondary_tiers[index].supports_residency_claims
+            ):
+                raise ValueError("write_back requires residency claims")
 
         self._job_id_counter: int = 0
         # Job tracking: maps job_id to metadata for all in-flight transfers.
@@ -357,6 +366,8 @@ class TieringOffloadingManager(OffloadingManager):
                         if completed_job.success
                         else set(completed_job.successful_keys or ())
                     )
+                    if completed_job.residency_claims:
+                        self._residency_claims[i].update(completed_job.residency_claims)
                     status = self._store_status[i]
                     for key in transfer_job.keys:
                         status[key] = (
@@ -388,11 +399,16 @@ class TieringOffloadingManager(OffloadingManager):
         tier_idx: int,
     ) -> None:
         tier = self.secondary_tiers[tier_idx]
-        if self._write_policies[tier_idx] == "tracked_write_through":
+        policy = self._write_policies[tier_idx]
+        if policy in ("tracked_write_through", "write_back"):
             keys = [
                 key
                 for key in keys
                 if self._store_status[tier_idx].get(key) != "copying"
+                and (
+                    policy != "write_back"
+                    or key not in self._residency_claims[tier_idx]
+                )
             ]
             if not keys:
                 return
@@ -401,10 +417,40 @@ class TieringOffloadingManager(OffloadingManager):
         ] == "best_effort" and not self._should_store_to_tier(tier, len(keys)):
             return
         job = self.create_store_job(keys, req_context, tier_idx)
+        if self._write_policies[tier_idx] == "write_back":
+            job.claim_residency = True
         tier.submit_store(job)
         for key in keys:
             self._store_status[tier_idx][key] = "copying"
         self._metrics.on_write_policy_keys(tier_idx, "submitted", len(keys))
+
+    def _writeback_protected_keys(self) -> set[OffloadKey]:
+        tiers = [
+            index
+            for index, policy in enumerate(self._write_policies)
+            if policy == "write_back"
+        ]
+        if not tiers:
+            return set()
+        return {
+            key
+            for key in self.primary_tier.resident_keys()
+            if any(key not in self._residency_claims[index] for index in tiers)
+        }
+
+    def _flush_writeback(self, req_context: ReqContext, *, max_keys: int = 32) -> None:
+        for index, policy in enumerate(self._write_policies):
+            if policy != "write_back":
+                continue
+            claimed = self._residency_claims[index]
+            status = self._store_status[index]
+            keys = [
+                key
+                for key in self.primary_tier.evictable_keys()
+                if key not in claimed and status.get(key) != "copying"
+            ][:max_keys]
+            if keys:
+                self._submit_cascade(keys, req_context, index)
 
     def _update_backpressure(
         self,
@@ -554,9 +600,12 @@ class TieringOffloadingManager(OffloadingManager):
         # Must happen immediately so primary.lookup() returns None (in-flight)
         # for this key on any subsequent lookup() call within the same step,
         # preventing duplicate promotion attempts.
-        primary_write_result = self.primary_tier.prepare_write([key], req_context)
+        primary_write_result = self.primary_tier.prepare_write(
+            [key], req_context, protected_keys=self._writeback_protected_keys()
+        )
 
         if primary_write_result is None:
+            self._flush_writeback(req_context)
             # Primary tier is full; caller should treat the chunk as unavailable
             # rather than retrying indefinitely.
             self._metrics.on_promotion_allocation_failure()
@@ -708,9 +757,12 @@ class TieringOffloadingManager(OffloadingManager):
         # Cascading of these newly-stored chunks to ALL secondary tiers
         # happens later in complete_store(), after the GPU→Primary transfer
         # completes.
-        primary_result = self.primary_tier.prepare_store(keys, req_context)
+        primary_result = self.primary_tier.prepare_store(
+            keys, req_context, protected_keys=self._writeback_protected_keys()
+        )
 
         if primary_result is None:
+            self._flush_writeback(req_context)
             return None
 
         self._record_unused_promotion_evictions(primary_result.evicted_keys)
@@ -769,7 +821,8 @@ class TieringOffloadingManager(OffloadingManager):
             return
 
         for tier_idx in request_level_tiers:
-            self._submit_cascade(ready_keys, req_context, tier_idx)
+            if self._write_policies[tier_idx] != "write_back":
+                self._submit_cascade(ready_keys, req_context, tier_idx)
 
     def _flush_pending_cascades(self) -> None:
         """Retry request-level cascades parked on an in-flight primary write.
@@ -822,7 +875,14 @@ class TieringOffloadingManager(OffloadingManager):
             # eviction during the async transfer). One prepare_read() call per
             # secondary tier.
             for tier_idx in range(len(self.secondary_tiers)):
-                self._submit_cascade(keys, req_context, tier_idx)
+                if self._write_policies[tier_idx] != "write_back":
+                    self._submit_cascade(keys, req_context, tier_idx)
+            if any(
+                policy == "write_back" for policy in self._write_policies
+            ) and self.primary_tier._get_num_free_chunks() <= max(
+                1, self.primary_tier._num_chunks // 5
+            ):
+                self._flush_writeback(req_context)
 
         # Note: The async transfers are now in flight. Their completion is
         # tracked via get_finished_jobs() / _maybe_process_finished_jobs().
@@ -1005,6 +1065,9 @@ class TieringOffloadingManager(OffloadingManager):
         # so manager bookkeeping is consistent before the primary reset.
         self._process_finished_jobs()
         assert not self._jobs
+        for index, claims in enumerate(self._residency_claims):
+            self.secondary_tiers[index].release_residency_claims(list(claims.values()))
+            claims.clear()
 
         # Deferred promotion submissions reserve primary slots that the
         # reset below invalidates; their submit_load() has not yet been
@@ -1044,6 +1107,11 @@ class TieringOffloadingManager(OffloadingManager):
             stats = None
 
         self._metrics.record_backpressure(self.secondary_tiers)
+        for index, policy in enumerate(self._write_policies):
+            if policy == "write_back":
+                self._metrics.set_writeback_claims(
+                    index, len(self._residency_claims[index])
+                )
         metrics_stats = self._metrics.take_stats()
         if metrics_stats is not None:
             if stats is None:

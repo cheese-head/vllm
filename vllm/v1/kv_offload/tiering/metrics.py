@@ -154,6 +154,13 @@ class TieringMetricsTracker:
                 (*self.tier_label(tier_idx), outcome),
             )
 
+    def set_writeback_claims(self, tier_idx: int, count: int) -> None:
+        self._stats.set_gauge(
+            TieringOffloadingMetrics.WRITEBACK_CLAIMS,
+            count,
+            self.tier_label(tier_idx),
+        )
+
     def on_hook_duration(self, hook: str, duration: float) -> None:
         self._stats.observe_histogram(
             TieringOffloadingMetrics.HOOK_DURATION, duration, (hook,)

@@ -249,6 +249,40 @@ def test_tracked_write_through_records_mixed_store_results():
     assert primary.lookup(keys[1], context) is LookupResult.HIT
 
 
+def test_write_back_waits_for_lower_residency_claim_before_eviction():
+    region = _mock_mmap_region(2)
+    primary = CPUPrimaryTierOffloadingManager(num_chunks=2, mmap_region=region)
+    tier = MetricsSecondaryTierManager(
+        offloading_spec=_MOCK_OFFLOADING_SPEC,
+        primary_kv_view=region.create_kv_memoryview(),
+        tier_type="test_metrics",
+    )
+    tier.supports_residency_claims = True
+    manager = TieringOffloadingManager(
+        primary_tier=primary,
+        secondary_tiers=[tier],
+        write_policies=["write_back"],
+    )
+    context = ReqContext(req_id="writeback")
+    key1, key2, key3 = to_keys([1, 2, 3])
+    manager.on_new_request(context)
+    for key in (key1, key2):
+        assert manager.prepare_store([key], context) is not None
+        manager.complete_store([key], context)
+    assert all(job.claim_residency for job in tier.submitted_stores)
+    assert manager.prepare_store([key3], context) is None
+    assert primary.lookup(key1, context) is LookupResult.HIT
+
+    tier.finished_jobs = [
+        JobResult(job.job_id, True, residency_claims={job.keys[0]: job.job_id})
+        for job in tier.submitted_stores
+    ]
+    manager.on_schedule_end(ScheduleEndContext(new_req_ids=[], preempted_req_ids=()))
+    result = manager.prepare_store([key3], context)
+    assert result is not None
+    assert len(result.evicted_keys) == 1
+
+
 class TestExampleSecondaryTierManager:
     """Tests for ExampleSecondaryTierManager implementation."""
 

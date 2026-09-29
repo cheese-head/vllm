@@ -272,6 +272,10 @@ class TieringOffloadingSpec(CPUOffloadingSpec):
             documentation="Secondary write keys submitted and completed by outcome.",
             labelnames=("tier", "outcome"),
         )
+        metrics[TieringOffloadingMetrics.WRITEBACK_CLAIMS] = OffloadingGaugeMetadata(
+            documentation="KVCR residencies held by write-back claims.",
+            labelnames=("tier",),
+        )
         metrics[TieringOffloadingMetrics.PROMOTION_JOB_FAILURES] = (
             OffloadingCounterMetadata(
                 documentation=(
@@ -473,10 +477,25 @@ class TieringOffloadingSpec(CPUOffloadingSpec):
                 write_policies: list[str] = []
                 for i, tier_config in enumerate(self.secondary_tier_configs):
                     write_policy = tier_config.get("write_policy", "best_effort")
-                    if write_policy not in ("best_effort", "tracked_write_through"):
+                    if write_policy not in (
+                        "best_effort",
+                        "tracked_write_through",
+                        "write_back",
+                    ):
                         raise ValueError(
                             f"Unsupported secondary write_policy {write_policy}"
                         )
+                    if write_policy == "write_back":
+                        if tier_config.get("type") != "kvcr":
+                            raise ValueError("write_back requires the KVCR tier")
+                        if int(tier_config.get("secondary_g2_slots", 0)) <= 0:
+                            raise ValueError("write_back requires KVCR local G2 slots")
+                        if tier_config.get("kvcr_service_socket_path") is not None:
+                            raise ValueError(
+                                "write_back with KVCR Guard is not supported"
+                            )
+                        if self.eviction_policy not in ("lru", "leaf_first_lru"):
+                            raise ValueError("write_back requires an LRU CPU policy")
                     write_policies.append(write_policy)
                     tier_runtime_config = {
                         key: value

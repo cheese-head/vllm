@@ -100,6 +100,18 @@ class CPUOffloadingManager(OffloadingManager):
     def _get_num_free_chunks(self) -> int:
         return len(self._free_list) + self._num_chunks - self._num_allocated_chunks
 
+    def resident_keys(self) -> set[OffloadKey]:
+        chunks = getattr(self._policy, "chunks", None)
+        if chunks is None:
+            raise ValueError("This cache policy does not expose resident keys")
+        return set(chunks)
+
+    def evictable_keys(self) -> list[OffloadKey]:
+        chunks = getattr(self._policy, "chunks", None)
+        if chunks is None:
+            raise ValueError("This cache policy does not expose evictable keys")
+        return [key for key, chunk in chunks.items() if chunk.ref_cnt == 0]
+
     def _allocate_chunks(self, keys: list[OffloadKey]) -> list[ChunkStatus]:
         num_fresh = min(len(keys), self._num_chunks - self._num_allocated_chunks)
         num_reused = len(keys) - num_fresh
@@ -261,6 +273,8 @@ class CPUOffloadingManager(OffloadingManager):
         self,
         keys: Collection[OffloadKey],
         req_context: ReqContext,
+        *,
+        protected_keys: Collection[OffloadKey] = (),
     ) -> PrepareStoreOutput | None:
         keys = list(keys)
         if self.counts is not None:
@@ -334,7 +348,7 @@ class CPUOffloadingManager(OffloadingManager):
 
             # Chunks from the original input are excluded from eviction candidates:
             # a chunk that was already stored must remain in the cache after this call.
-            protected = set(keys)
+            protected = set(keys) | set(protected_keys)
             evicted = self._policy.evict(num_chunks_to_evict, protected)
             if evicted is None:
                 self._store_allocation_failures += 1

@@ -83,6 +83,7 @@ class RecordingKVCR:
         self.deposit_calls: list[
             tuple[OpHandle, dict[BlockKey, list[MemDescriptor]]]
         ] = []
+        self.no_evict_calls: list[bool] = []
         self.completed: list[tuple[OpHandle, dict[BlockKey, OpEntryResult]]] = []
         self._next_op_handle = 1
 
@@ -119,12 +120,17 @@ class RecordingKVCR:
     def deposit(
         self,
         blocks: Mapping[BlockKey, list[MemDescriptor]],
+        no_evict: bool = False,
     ) -> OpHandle:
         op_handle = self._next_op_handle
         self._next_op_handle += 1
         self.deposit_calls.append((op_handle, dict(blocks)))
+        self.no_evict_calls.append(no_evict)
         self.complete(op_handle, {key: True for key in blocks})
         return op_handle
+
+    def release(self, handles):
+        return [(handle, True) for handle in handles]
 
     def complete(
         self,
@@ -549,6 +555,32 @@ def test_kvcr_store_reports_successful_keys_in_mixed_batch(monkeypatch):
     assert list(tier.get_finished_jobs()) == [
         JobResult(29, False, successful_keys={keys[0]})
     ]
+    tier.shutdown()
+
+
+def test_kvcr_store_claims_residency_for_write_back(monkeypatch):
+    kvcr = RecordingKVCR()
+    tier = _make_tier(monkeypatch, kvcr)
+    key = OffloadKey(b"write-back")
+    job = _job(31, ReqContext(req_id="claimed"), key=key)
+    job.claim_residency = True
+    tier.submit_store(job)
+    assert kvcr.no_evict_calls == [True]
+    handle, _ = kvcr.deposit_calls[-1]
+    kvcr.completed = [
+        (
+            handle,
+            {
+                BlockKey(bytes(key)): OpEntryResult(
+                    OpEntryStatus.SUCCESS, release_handle=8
+                )
+            },
+        )
+    ]
+    assert list(tier.get_finished_jobs()) == [
+        JobResult(31, True, residency_claims={key: 8})
+    ]
+    tier.release_residency_claims([8])
     tier.shutdown()
 
 
