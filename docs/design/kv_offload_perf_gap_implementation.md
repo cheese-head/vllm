@@ -4,7 +4,9 @@ This plan is grounded in vLLM `2840ca7a33` and KVCR `317e62f`. The four
 `perf-gap/01-*` through `perf-gap/04-*` branches contain measurement changes.
 Optional implementations for Stages 2 through 6 now live in separate commits
 on `perf-gap/05-*` through `perf-gap/09-*`. Stage 1's startup and page location
-probes are still pending. The implementations have static checks but have not
+diagnostics are on `perf-gap/11-numa-diagnostics`; the NIXL registration audit
+and sampled page queries remain pending. The implementations have static checks
+but have not
 been run with vLLM/KVCR or GPUs on the target host. Cherry-pick in the order
 below; each branch tip includes its predecessors. Do not reset the live cache
 to make comparisons; the benchmark operator owns workload runs.
@@ -29,7 +31,15 @@ placement comparison.
 
 ## Stage 1: NUMA evidence and safe startup ordering
 
-Pending branch: `perf-gap/numa-placement-probe`.
+Startup diagnostic branch: `perf-gap/11-numa-diagnostics`.
+
+Set `cpu_numa_diagnostics: true` in `kv_connector_extra_config` on both simple
+CPU and tiering runs. Startup logs include the process, worker slot or
+scheduler, cpuset memory nodes, CPU affinity, and the mapped region's per-node
+page counts from `/proc/self/numa_maps`. The probe runs after first-touch
+population and before tiering constructs the secondary. This is a startup
+snapshot; NIXL registration behavior and later page migration need separate
+inspection on the target host.
 
 Add bounded startup diagnostics for the actual EngineCore and worker CPU
 affinity, GPU physical index and NUMA node, cpuset-allowed memory nodes,

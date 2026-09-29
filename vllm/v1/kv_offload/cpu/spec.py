@@ -208,6 +208,9 @@ class CPUOffloadingSpec(OffloadingSpec):
                 kv_bytes_per_chunk=self.kv_bytes_per_chunk,
                 cpu_page_size=self.cpu_page_size_per_worker,
                 barrier=_all_workers_barrier,
+                diagnose_numa=bool(
+                    self.extra_config.get("cpu_numa_diagnostics", False)
+                ),
             )
         try:
             return CPUOffloadingWorker(

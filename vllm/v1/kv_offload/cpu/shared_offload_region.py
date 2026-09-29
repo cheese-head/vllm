@@ -1,11 +1,13 @@
 # SPDX-License-Identifier: Apache-2.0
 # SPDX-FileCopyrightText: Copyright contributors to the vLLM project
 import contextlib
+import ctypes
 import errno
 import mmap
 import os
 import time
 from collections.abc import Callable
+from pathlib import Path
 
 import numpy as np
 import torch
@@ -21,6 +23,22 @@ logger = init_logger(__name__)
 
 # MADV_POPULATE_WRITE was added in Linux 5.14 (value 23).
 _MADV_POPULATE_WRITE = getattr(mmap, "MADV_POPULATE_WRITE", 23)
+
+
+def _numa_mapping_pages(mmap_obj: mmap.mmap) -> str:
+    """Return bounded per-node page counts for this process's mmap address."""
+    address = ctypes.addressof(ctypes.c_char.from_buffer(mmap_obj))
+    for line in Path("/proc/self/numa_maps").read_text().splitlines():
+        if int(line.split(" ", 1)[0], 16) == address:
+            return (
+                " ".join(
+                    field
+                    for field in line.split()
+                    if field.startswith("N") and field[1:].split("=", 1)[0].isdigit()
+                )
+                or "no resident pages reported"
+            )
+    return "mapping unavailable"
 
 
 def _wait_for_file_size(fd: int, expected_size: int, timeout: float = 30.0) -> None:
@@ -99,6 +117,7 @@ class SharedOffloadRegion:
         creator_memory_check: Callable[[int], None] | None = None,
         populate_only_on_creator: bool = False,
         numa_nodes: list[int] | None = None,
+        diagnose_numa: bool = False,
     ) -> None:
         if populate_only_on_creator and barrier is None:
             raise ValueError("Creator-only population requires a barrier.")
@@ -212,6 +231,8 @@ class SharedOffloadRegion:
         self.pinned_addresses: list[int] = []
 
         if populate_only_on_creator:
+            if diagnose_numa:
+                self._log_numa_diagnostics("replicated_worker")
             return
 
         if numa_nodes is not None:
@@ -220,6 +241,8 @@ class SharedOffloadRegion:
             except Exception:
                 self.cleanup()
                 raise
+            if diagnose_numa:
+                self._log_numa_diagnostics("scheduler_numa")
             return
 
         populate_write_fn = _get_populate_write_fn(self.mmap_obj)
@@ -247,6 +270,37 @@ class SharedOffloadRegion:
             logger.debug(
                 "MADV_POPULATE_WRITE entire region: %.3f s", time.perf_counter() - _t0
             )
+        if diagnose_numa:
+            self._log_numa_diagnostics("worker" if rank is not None else "scheduler")
+
+    def _log_numa_diagnostics(self, population_actor: str) -> None:
+        assert self.mmap_obj is not None
+        try:
+            status = Path("/proc/self/status").read_text().splitlines()
+            mems = next(
+                (
+                    line.partition(":")[2].strip()
+                    for line in status
+                    if line.startswith("Mems_allowed_list:")
+                ),
+                "unavailable",
+            )
+            pages = _numa_mapping_pages(self.mmap_obj)
+            affinity = sorted(os.sched_getaffinity(0))
+            logger.info(
+                "CPU KV offload NUMA startup: pid=%d rank=%s actor=%s "
+                "memory_nodes=%s cpu_affinity_count=%d cpu_affinity_first=%s "
+                "mapping_pages=%s",
+                os.getpid(),
+                self.rank,
+                population_actor,
+                mems,
+                len(affinity),
+                affinity[:16],
+                pages,
+            )
+        except (OSError, ValueError) as exc:
+            logger.warning("CPU KV offload NUMA startup probe failed: %s", exc)
 
     def _populate_numa_slices(self, cpu_page_size: int, nodes: list[int]) -> None:
         if cpu_page_size % self.page_size:

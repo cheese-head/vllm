@@ -460,6 +460,9 @@ class TieringOffloadingSpec(CPUOffloadingSpec):
                     kv_bytes_per_chunk=self.kv_bytes_per_chunk,
                     cpu_page_size=self.cpu_page_size_per_worker,
                     numa_nodes=self._primary_numa_nodes(),
+                    diagnose_numa=bool(
+                        self.extra_config.get("cpu_numa_diagnostics", False)
+                    ),
                 )
                 self._scheduler_mmap = scheduler_mmap
 
@@ -600,6 +603,7 @@ class TieringOffloadingSpec(CPUOffloadingSpec):
             rank=rank,
             kv_bytes_per_chunk=self.kv_bytes_per_chunk,
             cpu_page_size=self.cpu_page_size_per_worker,
+            diagnose_numa=bool(self.extra_config.get("cpu_numa_diagnostics", False)),
         )
         try:
             if self.config.canonical_layout:
