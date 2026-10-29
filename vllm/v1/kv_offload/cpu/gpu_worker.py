@@ -1,5 +1,6 @@
 # SPDX-License-Identifier: Apache-2.0
 # SPDX-FileCopyrightText: Copyright contributors to the vLLM project
+import copy
 import functools
 import time
 from collections import deque
@@ -27,6 +28,10 @@ from vllm.v1.kv_offload.base import (
     OffloadingWorker,
     TransferResult,
 )
+from vllm.v1.kv_offload.cpu.copy_executor import (
+    CopyExecutorConfig,
+    NativeCopyExecutor,
+)
 from vllm.v1.kv_offload.cpu.shared_offload_region import SharedOffloadRegion
 from vllm.v1.kv_offload.cpu.swap_blocks_triton import (
     THRESHOLD_BYTES,
@@ -34,6 +39,7 @@ from vllm.v1.kv_offload.cpu.swap_blocks_triton import (
 )
 
 logger = init_logger(__name__)
+_RETAINED_NATIVE_CPU_WORKERS: list[object] = []
 
 
 def _select_swap_blocks_fn(
@@ -807,12 +813,16 @@ class CPUOffloadingWorker(OffloadingWorker):
         num_cpu_chunks: int,
         mmap_region: SharedOffloadRegion | None = None,
         canonical_layout: bool = False,
+        copy_executor_config: CopyExecutorConfig | None = None,
     ):
+        if copy_executor_config is not None and not current_platform.is_cuda():
+            raise ValueError("cpu_copy_executor currently requires CUDA")
         assert not canonical_layout or mmap_region is not None
         # The caller owns mmap_region until this constructor returns. After a
         # successful construction, the worker is the sole owner and releases
         # it after both transfer directions have stopped.
         self._mmap_region = mmap_region
+        self._copy_executor = None
         pin_memory = PIN_MEMORY
         logger.info("Allocating %d CPU tensors...", len(kv_caches.tensors))
         if mmap_region is not None and pin_memory:
@@ -882,26 +892,99 @@ class CPUOffloadingWorker(OffloadingWorker):
             host_memory_is_pinned=host_memory_is_pinned,
         )
 
+        if copy_executor_config is not None:
+            from vllm.v1.kv_offload.cpu.copy_backend import CudaCopyBackend
+
+            self._copy_executor = NativeCopyExecutor(
+                CudaCopyBackend(
+                    self._store_handler,
+                    self._load_handler,
+                    _new_descriptor_buffers,
+                ),
+                copy_executor_config,
+            )
+
+    def _enqueue(self, job_id, direction, src_spec, dst_spec):
+        if not isinstance(src_spec, BlockIDsLoadStoreSpec) or not isinstance(
+            dst_spec, BlockIDsLoadStoreSpec
+        ):
+            raise TypeError("Native CPU copies require block-ID specs")
+        source, target = copy.copy(src_spec), copy.copy(dst_spec)
+        source.block_ids = src_spec.block_ids.copy()
+        target.block_ids = dst_spec.block_ids.copy()
+        for spec in (source, target):
+            spec.block_ids.flags.writeable = False
+            if isinstance(spec, GPULoadStoreSpec):
+                spec.group_sizes = tuple(spec.group_sizes)
+                spec.block_indices = tuple(spec.block_indices)
+        producer = torch.Event()
+        producer.record(current_platform.current_stream())
+        charge = source.block_ids.nbytes + target.block_ids.nbytes
+        gpu = source if direction == "store" else target
+        if not isinstance(gpu, GPULoadStoreSpec):
+            raise TypeError("Native CPU copies require GPU group coordinates")
+        charge += 8 * (len(gpu.group_sizes) + len(gpu.block_indices))
+        assert self._copy_executor is not None
+        self._copy_executor.submit(
+            job_id, direction, (direction, source, target), producer, charge
+        )
+        return True
+
     def submit_store(
         self, job_id: int, src_spec: GPULoadStoreSpec, dst_spec: LoadStoreSpec
     ) -> bool:
         """Async GPU -> CPU."""
+        if self._copy_executor is not None:
+            return self._enqueue(job_id, "store", src_spec, dst_spec)
         return self._store_handler.transfer_async(job_id, src_spec, dst_spec)
 
     def submit_load(
         self, job_id: int, src_spec: LoadStoreSpec, dst_spec: GPULoadStoreSpec
     ) -> bool:
         """Async CPU -> GPU."""
+        if self._copy_executor is not None:
+            return self._enqueue(job_id, "load", src_spec, dst_spec)
         return self._load_handler.transfer_async(job_id, src_spec, dst_spec)
 
     def get_finished(self) -> list[TransferResult]:
+        if self._copy_executor is not None:
+            return [
+                TransferResult(
+                    job_id=result.job_id,
+                    success=True,
+                    transfer_size=result.nbytes,
+                    physical_transfer_stats=tuple(
+                        (s.nbytes, s.seconds) for s in result.physical_stats
+                    ),
+                )
+                for result in self._copy_executor.get_finished()
+            ]
         return self._store_handler.get_finished() + self._load_handler.get_finished()
 
     def wait(self, job_ids: set[int]) -> None:
+        if self._copy_executor is not None:
+            self._copy_executor.wait(job_ids)
+            return
         self._store_handler.wait(job_ids)
         self._load_handler.wait(job_ids)
 
+    def get_executor_statistics(self):
+        executor = self._copy_executor
+        return executor.statistics() if executor is not None else {}
+
     def shutdown(self) -> None:
+        executor = getattr(self, "_copy_executor", None)
+        if executor is not None:
+            try:
+                executor.close()
+            finally:
+                if executor.quiescent:
+                    if self._mmap_region is not None:
+                        self._mmap_region.cleanup()
+                        self._mmap_region = None
+                elif not any(w is self for w in _RETAINED_NATIVE_CPU_WORKERS):
+                    _RETAINED_NATIVE_CPU_WORKERS.append(self)
+            return
         handler_failed = False
         try:
             self._store_handler.shutdown()

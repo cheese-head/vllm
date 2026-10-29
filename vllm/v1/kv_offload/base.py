@@ -563,6 +563,11 @@ class TransferResult:
     success: bool
     transfer_size: int | None = None
     transfer_time: float | None = None
+    # Batched backends cannot attribute a physical duration to a logical job.
+    # Each physical operation's exact (bytes, seconds) is reported once here;
+    # an empty tuple means its statistics were attached to another result.
+    # None retains the legacy one-operation-per-job accounting above.
+    physical_transfer_stats: tuple[tuple[int, float], ...] | None = None
 
 
 class OffloadingWorker(ABC):

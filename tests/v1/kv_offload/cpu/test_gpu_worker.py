@@ -22,6 +22,7 @@ from vllm.v1.kv_offload.base import (
 )
 from vllm.v1.kv_offload.cpu import gpu_worker
 from vllm.v1.kv_offload.cpu.common import CPULoadStoreSpec
+from vllm.v1.kv_offload.cpu.copy_executor import CopyExecutorConfig
 from vllm.v1.kv_offload.cpu.gpu_worker import CPUOffloadingWorker
 from vllm.v1.kv_offload.cpu.shared_offload_region import SharedOffloadRegion
 
@@ -35,6 +36,16 @@ DEVICE_TYPE = current_platform.device_type
 DEVICES = [f"{DEVICE_TYPE}:0"]
 NUM_MAPPINGS = [3]
 NUM_MAPPINGS_PER_GROUP = [2]
+COPY_EXECUTOR_CONFIGS = [
+    pytest.param(None, id="legacy"),
+    pytest.param(
+        CopyExecutorConfig(max_batch_descriptors=3, target_batch_bytes=2048),
+        id="executor",
+        marks=pytest.mark.skipif(
+            not current_platform.is_cuda(), reason="executor requires CUDA"
+        ),
+    ),
+]
 
 
 @pytest.mark.skipif(not current_platform.is_rocm(), reason="ROCm-specific test")
@@ -236,6 +247,7 @@ def test_worker_syncs_before_cleanup_after_handler_failure(
         assert "Device sync before mmap cleanup failed" in caplog_vllm.text
 
 
+@pytest.mark.parametrize("copy_executor_config", COPY_EXECUTOR_CONFIGS)
 @pytest.mark.parametrize("gpu_to_cpu", [True, False])
 @pytest.mark.parametrize("num_mappings", NUM_MAPPINGS)
 @pytest.mark.parametrize("gpu_page_size_bytes", GPU_PAGE_SIZES)
@@ -252,6 +264,7 @@ def test_worker_syncs_before_cleanup_after_handler_failure(
 @torch.inference_mode()
 def test_transfer(
     default_vllm_config,
+    copy_executor_config,
     gpu_to_cpu: bool,
     num_mappings: int,
     gpu_page_size_bytes: int,
@@ -320,6 +333,7 @@ def test_transfer(
         blocks_per_chunk=blocks_per_chunk,
         num_cpu_chunks=num_cpu_chunks,
         mmap_region=mmap_region,
+        copy_executor_config=copy_executor_config,
     )
 
     # select block mappings
@@ -374,7 +388,8 @@ def test_transfer(
         assert worker.submit_store(1, src_spec, dst_spec)
     else:
         assert worker.submit_load(1, src_spec, dst_spec)
-    assert {x.job_id for x in handler._transfers} == {1}
+    if copy_executor_config is None:
+        assert {x.job_id for x in handler._transfers} == {1}
 
     # wait for transfer to complete
     end_time = time.time() + 10
@@ -387,10 +402,17 @@ def test_transfer(
                 len(gpu_blocks)
                 * sum([x.page_size_bytes for x in handler.layer_refs_per_group[0]])
             )
-            assert finished[0].transfer_time > 0
-            assert finished[0].transfer_time < (time.time() - start_time)
+            if copy_executor_config is None:
+                assert finished[0].transfer_time > 0
+                assert finished[0].transfer_time < (time.time() - start_time)
+            else:
+                physical = finished[0].physical_transfer_stats
+                assert sum(n for n, _ in physical) == finished[0].transfer_size
+                assert all(t >= 0 for _, t in physical)
             break
         time.sleep(0.1)
+
+    assert finished, "copy did not complete before the deadline"
 
     # verify src tensors did not change
     for orig_tensor, tensor in zip(orig_src_tensors, handler.src_tensors):
@@ -421,6 +443,7 @@ def test_transfer(
     worker.shutdown()
 
 
+@pytest.mark.parametrize("copy_executor_config", COPY_EXECUTOR_CONFIGS)
 @pytest.mark.parametrize("gpu_to_cpu", [True, False])
 @pytest.mark.parametrize("num_mappings_per_group", NUM_MAPPINGS_PER_GROUP)
 @pytest.mark.parametrize("gpu_page_size_bytes", GPU_PAGE_SIZES)
@@ -432,6 +455,7 @@ def test_transfer(
 @torch.inference_mode()
 def test_transfer_multi_group(
     default_vllm_config,
+    copy_executor_config,
     gpu_to_cpu: bool,
     num_mappings_per_group: int,
     gpu_page_size_bytes: int,
@@ -487,6 +511,7 @@ def test_transfer_multi_group(
         kv_caches=canonical_kv_caches,
         blocks_per_chunk=blocks_per_chunk,
         num_cpu_chunks=num_cpu_chunks,
+        copy_executor_config=copy_executor_config,
     )
 
     # group 0: aligned, group 1: empty, group 2: unaligned on CPU->GPU
@@ -586,7 +611,8 @@ def test_transfer_multi_group(
         assert worker.submit_store(1, src_spec, dst_spec)
     else:
         assert worker.submit_load(1, src_spec, dst_spec)
-    assert {x.job_id for x in handler._transfers} == {1}
+    if copy_executor_config is None:
+        assert {x.job_id for x in handler._transfers} == {1}
 
     end_time = time.time() + 10
     while time.time() < end_time:
@@ -603,6 +629,8 @@ def test_transfer_multi_group(
             assert finished[0].transfer_size == expected_bytes
             break
         time.sleep(0.1)
+
+    assert finished, "copy did not complete before the deadline"
 
     # verify src tensors did not change
     for orig_tensor, tensor in zip(orig_src_tensors, handler.src_tensors):
@@ -635,8 +663,11 @@ def test_transfer_multi_group(
     not current_platform.is_cuda_alike(),
     reason="stream ordering test requires a CUDA-like platform",
 )
+@pytest.mark.parametrize("copy_executor_config", COPY_EXECUTOR_CONFIGS)
 @torch.inference_mode()
-def test_load_waits_for_pending_compute_stream_writes(default_vllm_config) -> None:
+def test_load_waits_for_pending_compute_stream_writes(
+    default_vllm_config, copy_executor_config
+) -> None:
     """A CPU load must land after pending writes to its GPU destination."""
     device = DEVICES[0]
     page_size_bytes = 128 * 1024
@@ -661,6 +692,7 @@ def test_load_waits_for_pending_compute_stream_writes(default_vllm_config) -> No
         ),
         blocks_per_chunk=1,
         num_cpu_chunks=num_blocks,
+        copy_executor_config=copy_executor_config,
     )
     worker._load_handler.src_tensors[0].fill_(sentinel)
     expected = torch.full((page_size_bytes,), sentinel, dtype=torch.int8)

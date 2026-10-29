@@ -287,17 +287,21 @@ class OffloadingConnectorWorker:
             job_id = transfer_result.job_id
             assert transfer_result.success
             is_load = job_id in self._load_jobs
-            if (
+            stats = (
+                self._connector_worker_meta.transfer_stats.load
+                if is_load
+                else self._connector_worker_meta.transfer_stats.store
+            )
+            physical = getattr(transfer_result, "physical_transfer_stats", None)
+            if physical is not None:
+                for nbytes, seconds in physical:
+                    stats.record(nbytes, seconds)
+            elif (
                 transfer_result.transfer_time is not None
                 and transfer_result.transfer_size is not None
             ):
-                if is_load:
-                    stats = self._connector_worker_meta.transfer_stats.load
-                else:
-                    stats = self._connector_worker_meta.transfer_stats.store
                 stats.record(
-                    transfer_result.transfer_size,
-                    transfer_result.transfer_time,
+                    transfer_result.transfer_size, transfer_result.transfer_time
                 )
 
             self._connector_worker_meta.mark_completed(job_id)

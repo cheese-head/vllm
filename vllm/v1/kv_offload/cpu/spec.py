@@ -19,6 +19,7 @@ from vllm.v1.kv_offload.base import (
 )
 from vllm.v1.kv_offload.config import OffloadingConfig
 from vllm.v1.kv_offload.cpu.common import CPUOffloadingMetrics
+from vllm.v1.kv_offload.cpu.copy_executor import CopyExecutorConfig
 from vllm.v1.kv_offload.cpu.gpu_worker import CPUOffloadingWorker
 from vllm.v1.kv_offload.cpu.manager import CPUOffloadingManager
 from vllm.v1.kv_offload.cpu.shared_offload_region import SharedOffloadRegion
@@ -93,6 +94,9 @@ class CPUOffloadingSpec(OffloadingSpec):
 
     def __init__(self, config: OffloadingConfig):
         super().__init__(config)
+        self.copy_executor_config = CopyExecutorConfig.from_extra_config(
+            self.extra_config
+        )
 
         cpu_bytes_to_use = self.extra_config.get("cpu_bytes_to_use")
         if not cpu_bytes_to_use:
@@ -190,6 +194,7 @@ class CPUOffloadingSpec(OffloadingSpec):
                 blocks_per_chunk=self.blocks_per_chunk,
                 num_cpu_chunks=self.num_chunks,
                 mmap_region=mmap_region,
+                copy_executor_config=self.copy_executor_config,
             )
         except Exception:
             if mmap_region is not None:

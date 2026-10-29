@@ -112,6 +112,123 @@ vllm serve <model> \
 | `self_describing_kv_events` | no | `false` | both | Opt-in. When `true` *and* KV cache events are enabled (`--kv-events-config` with `enable_kv_cache_events`), the connector emits self-describing block-granular `BlockStored`/`BlockRemoved` payloads (constituent block hashes, whole-chunk `token_ids`, per-block `block_size`, parent hash, LoRA + group/cache-spec metadata) instead of the placeholder fallback, so external KV-event consumers can index offloaded blocks. Inert unless events are enabled. With `TieringOffloadingSpec`, a CPU promotion is self-describing when a local request observes its primary-tier `HIT` before event translation; otherwise its stored event may retain the placeholder, while a later `HIT` can backfill metadata for removal. Pending-removal/re-promotion races and externally initiated promotions may also produce placeholders, and consumers must ignore removals for unknown hashes. Partial recurrent tails emit the hash-aligned portion from the physical block start through the tail boundary. Other sliding-window/SSM chunks keep the placeholder fallback. In chunk mode (`block_size` > GPU block size, or `blocks_per_chunk` > 1), overlapping chunks re-announce shared per-block hashes, so consumers must reference-count (deduplicate) repeated store/remove announcements. |
 | `spec_module_path` | no | — | both | Python import path for a custom `OffloadingSpec` not in the built-in registry. Required only when `spec_name` is not built-in (advanced). |
 
+## Experimental native CPU copy executor
+
+The native CPU tier has an opt-in CUDA copy executor. It moves descriptor
+preparation and device submission to one background thread per model worker,
+reuses direction-specific streams and pinned descriptor buffers, and coalesces
+independent copies. The default worker path is unchanged. Both
+`CPUOffloadingSpec` and the CPU primary tier of `TieringOffloadingSpec` accept
+this configuration inside `kv_connector_extra_config`:
+
+```json
+{
+  "cpu_bytes_to_use": 10737418240,
+  "cpu_copy_executor": {
+    "enabled": true,
+    "max_pending_jobs": 256,
+    "max_pending_bytes": 67108864,
+    "max_inflight_batches": 8,
+    "max_batch_descriptors": 4096,
+    "target_batch_bytes": 67108864,
+    "admission_timeout": 60.0,
+    "fence_timeout": 600.0,
+    "shutdown_timeout": 60.0
+  }
+}
+```
+
+Unknown executor keys, invalid budgets, and non-finite or non-positive timeouts
+are rejected. Enabling it on a non-CUDA platform is rejected before worker
+allocation. Omit `cpu_copy_executor` or set `enabled` to `false` to use the
+existing worker.
+
+### Ownership, limits and completion
+
+Submission captures a producer event on the calling model stream and owns a
+copy of the block IDs and group coordinates. The background thread selects its
+device from the local KV tensor, prepares bounded chunks with the existing
+native direct/canonical layout fillers, and waits on that producer event before
+copying. It preserves FIFO ordering within each direction. Loads and stores
+have separate streams; as before, the scheduler must fence conflicting block
+reuse. Potentially overlapping address envelopes are kept in separate physical
+batches. This check is conservative and may limit coalescing.
+
+`max_pending_bytes` charges queued and in-flight block-ID metadata, not KV data
+or total process memory. `max_pending_jobs` bounds those live logical jobs.
+Admission can block until copies complete, with an explicit timeout. A single
+oversized metadata job is admitted alone to guarantee progress. Physical
+batches have descriptor and byte targets; one indivisible model-layout block
+may exceed either target. Completed acknowledgments contain no copy buffers and
+remain until the model worker polls `get_finished()`; callers must keep polling
+between scheduling steps. These are not hard bounds on total process memory.
+
+A logical job completes only after every physical part has finished. A reuse
+fence waits for the requested IDs, including their FIFO predecessors, rather
+than an unrelated queue tail or a numerically larger job ID. Preparation or
+CUDA errors fail the executor and wake waiters; accepted work is never silently
+dropped or retried. Shutdown drains both streams before releasing host mappings.
+If quiescence cannot be established, mappings and descriptor storage are
+retained for safety and shutdown reports an error.
+
+Transfer statistics report exact physical bytes and CUDA elapsed time once per
+physical operation, in the correct direction. Logical job acknowledgments still
+occur once per job. Consequently, transfer-size samples describe physical
+batches with this executor, and do not represent logical job sizes or prorated
+job latency. `CPUOffloadingWorker.get_executor_statistics()` exposes aggregate
+queue, preparation, admission and fence times, physical batch count, and live
+metadata high-water marks; these are diagnostic counters, not new Prometheus
+metrics. Queue time ends at first submission; observed batch time includes
+completion polling latency, while physical transfer time uses CUDA events.
+
+### Model and parallelism compatibility
+
+The executor consumes normalized native KV cache groups and canonical copy
+plans, not model names or attention-head assumptions. It preserves heterogeneous
+group sizes, empty groups, page strides, aliases, partial CPU chunks, canonical
+writer rotation, and sharded or replicated layouts. Each model worker owns its
+executor; device selection does not use global rank. Scheduler job IDs,
+per-rank acknowledgments and per-engine DP isolation retain the existing
+connector protocol. No new collective or TP=1 shortcut is introduced.
+
+This does **not** expand the native connector's existing model, TP, DP, EP,
+DCP/PCP, shared-memory, or multi-node support. In particular, rank-local copy
+correctness does not establish shared-region placement or collective correctness
+for an arbitrary topology. Models with unsupported native KV layouts remain
+unsupported. Expert parallelism uses the existing attention KV layout and
+worker acknowledgment group; experts do not acquire an independent KV copy
+protocol.
+
+### Validation and rollout
+
+The CPU executor suite covers ordering, admission pressure, exact logical and
+physical accounting, failure propagation, and shutdown. The adapter suite
+compares split descriptors against the original native fillers across grouped,
+strided, direct and canonical layouts, including multiple canonical writers.
+A deterministic stream simulator checks delayed producer writes and byte-exact
+store/load round trips. Acknowledgment aggregation tests simulate multiple ranks
+and DP replicas; they are not distributed execution tests.
+
+The existing GPU transfer, multi-group and producer-ordering tests now run in
+both legacy and executor modes, with small batch targets to force splitting.
+Run these on a healthy CUDA worker using the normal vLLM test environment:
+
+```bash
+.venv/bin/python -m pytest tests/v1/kv_offload/cpu/test_copy_executor.py tests/v1/kv_offload/cpu/test_copy_backend.py
+.venv/bin/python -m pytest tests/v1/kv_offload/cpu/test_gpu_worker.py -k 'transfer or pending_compute_stream'
+```
+
+Before enabling it by default, validate real model output and cache-hit
+correctness with dense GQA/MQA, replicated MLA and hybrid grouped-cache models;
+TP=1/2/4/8; DP>1; EP>1 with its actual attention parallel group; and any supported
+context/pipeline parallel or multi-node deployment. Exercise aborts, cache
+reuse, saturated stores with mandatory loads, and process shutdown. Compare
+foreground preparation time, throughput and latency against both the legacy
+native worker and SimpleCPU under identical completed-request sets. CPU mocks
+and descriptor equivalence alone establish neither these distributed guarantees
+nor a performance win. No such GPU/distributed or model evaluation result is
+claimed for this implementation.
+
 ## Custom Eviction Policies
 
 `eviction_policy` resolves through `CachePolicyFactory` (`vllm/v1/kv_offload/cpu/policies/factory.py`), which pre-registers the built-in `lru` and `arc` policies.
