@@ -17,6 +17,7 @@ from vllm.v1.kv_offload.cpu.copy_executor import (
     CopyExecutorConfig,
     PhysicalCopyStats,
 )
+from vllm.v1.kv_offload.cpu.transfer_lifecycle import RecordedDependencies
 
 
 @dataclass
@@ -212,7 +213,10 @@ class CudaCopyBackend:
         # Retain buffers even if submission fails after accepting some DMA.
         self._tickets.add(ticket)
         for producer in producers:
-            stream.wait_event(producer)
+            if isinstance(producer, RecordedDependencies):
+                producer.wait_on(stream)
+            else:
+                stream.wait_event(producer)
         with current_platform.stream(stream):
             start.record(stream)
             if count:

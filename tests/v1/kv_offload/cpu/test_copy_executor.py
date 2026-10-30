@@ -408,3 +408,22 @@ def test_deadlines_do_not_acknowledge_or_discard_unfinished_work(operation):
     finally:
         backend.gate.set()
         executor.close()
+
+
+@pytest.mark.parametrize("mode", ["legacy", "capture_only", "selective"])
+def test_lifecycle_mode_is_explicit_and_does_not_enable_executor(monkeypatch, mode):
+    monkeypatch.setenv("VLLM_NATIVE_CPU_LIFECYCLE_MODE", mode)
+    assert Config.from_extra_config({}) is None
+    assert Config.from_extra_config({"cpu_copy_executor": {"enabled": False}}) is None
+    config = Config.from_extra_config({"cpu_copy_executor": {"enabled": True}})
+    assert config.lifecycle_mode == mode
+    explicit = Config.from_extra_config(
+        {"cpu_copy_executor": {"enabled": True, "lifecycle_mode": "legacy"}}
+    )
+    assert explicit.lifecycle_mode == "legacy"
+
+
+def test_unknown_lifecycle_mode_is_rejected_before_executor_start(monkeypatch):
+    monkeypatch.setenv("VLLM_NATIVE_CPU_LIFECYCLE_MODE", "unsafe")
+    with pytest.raises(ValueError, match="lifecycle_mode"):
+        Config.from_extra_config({"cpu_copy_executor": {"enabled": True}})

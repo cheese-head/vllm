@@ -15,6 +15,7 @@ if TYPE_CHECKING:
     from vllm.distributed.kv_transfer.kv_connector.v1.offloading.metrics import (
         OffloadingConnectorStats,
     )
+    from vllm.v1.kv_offload.cpu.transfer_lifecycle import CapturedStoreIntent
 
 from vllm.v1.kv_hints import KvHintsEnvelope
 from vllm.v1.kv_offload.config import OffloadingConfig
@@ -574,6 +575,30 @@ class OffloadingWorker(ABC):
     """Runs in the worker process. Performs async KV transfers for ONE
     offloaded medium (e.g. CPU). Direction is explicit via submit_store /
     submit_load, so there is no (src_medium, dst_medium) routing."""
+
+    def store_lifecycle_mode(self) -> str:
+        return "legacy"
+
+    def get_executor_statistics(self) -> dict[str, int | float]:
+        return {}
+
+    def store_lifecycle_limits(self) -> tuple[int, int]:
+        raise NotImplementedError("This worker has no captured-store capability")
+
+    def capture_store_dependency(self) -> Any:
+        raise NotImplementedError("This worker has no captured-store capability")
+
+    def capture_store(
+        self,
+        job_id: int,
+        src_spec: GPULoadStoreSpec,
+        dst_spec: LoadStoreSpec,
+        producer: Any,
+    ) -> "CapturedStoreIntent":
+        raise NotImplementedError("This worker has no captured-store capability")
+
+    def submit_store_intent(self, intent: "CapturedStoreIntent") -> bool:
+        raise NotImplementedError("This worker has no captured-store capability")
 
     @abstractmethod
     def submit_store(

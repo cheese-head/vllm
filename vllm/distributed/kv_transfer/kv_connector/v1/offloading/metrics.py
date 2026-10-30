@@ -1,6 +1,7 @@
 # SPDX-License-Identifier: Apache-2.0
 # SPDX-FileCopyrightText: Copyright contributors to the vLLM project
 from dataclasses import dataclass
+from math import isfinite
 from typing import Any
 
 from vllm.config import VllmConfig
@@ -60,8 +61,113 @@ TRANSFER_SIZE_BUCKETS = (
 )
 
 
+class _ExecutorMetricName:
+    TIME = "vllm:kv_offload_executor_time_seconds"
+    OPERATIONS = "vllm:kv_offload_executor_operations"
+    PENDING_JOBS = "vllm:kv_offload_executor_pending_jobs"
+    PENDING_METADATA = "vllm:kv_offload_executor_pending_metadata_bytes"
+    COMPLETED_UNPOLLED = "vllm:kv_offload_executor_completed_unpolled"
+    JOBS_HIGH_WATER = "vllm:kv_offload_executor_pending_jobs_high_water"
+    METADATA_HIGH_WATER = "vllm:kv_offload_executor_pending_bytes_high_water"
+    SELECTIVE_ENABLED = "vllm:kv_offload_executor_selective_enabled"
+
+
+_EXECUTOR_TIMING_STAGES = {
+    "capture_seconds": "capture",
+    "intent_submit_seconds": "intent_submit",
+    "admission_wait_seconds": "admission",
+    "queue_seconds": "queue",
+    "preparation_seconds": "preparation",
+    "fence_wait_seconds": "fence",
+    "observed_batch_seconds": "observed_batch",
+}
+_EXECUTOR_OPERATION_KINDS = {
+    "accepted_jobs": "accepted",
+    "completed_jobs": "completed",
+    "physical_batches": "batches",
+    "fence_calls": "fences",
+    "capacity_fallbacks": "capacity_fallbacks",
+}
+_EXECUTOR_GAUGES = {
+    "pending_jobs": _ExecutorMetricName.PENDING_JOBS,
+    "pending_metadata_bytes": _ExecutorMetricName.PENDING_METADATA,
+    "completed_unpolled": _ExecutorMetricName.COMPLETED_UNPOLLED,
+    "pending_jobs_high_water": _ExecutorMetricName.JOBS_HIGH_WATER,
+    "pending_bytes_high_water": _ExecutorMetricName.METADATA_HIGH_WATER,
+    "selective_enabled": _ExecutorMetricName.SELECTIVE_ENABLED,
+}
+
+
+def get_executor_metric_definitions() -> dict[str, OffloadingMetricMetadata]:
+    return {
+        _ExecutorMetricName.TIME: OffloadingCounterMetadata(
+            documentation=(
+                "Native copy executor accumulated seconds per rank and stage. "
+                "Stages may overlap; observed_batch is not CUDA copy duration."
+            ),
+            labelnames=("rank", "stage"),
+        ),
+        _ExecutorMetricName.OPERATIONS: OffloadingCounterMetadata(
+            documentation="Native copy executor operation counts per rank and kind.",
+            labelnames=("rank", "kind"),
+        ),
+        **{
+            name: OffloadingGaugeMetadata(
+                documentation=f"Native copy executor {key} snapshot per rank.",
+                labelnames=("rank",),
+            )
+            for key, name in _EXECUTOR_GAUGES.items()
+        },
+    }
+
+
+def record_executor_statistics(
+    stats: "OffloadingConnectorStats", samples: dict[int, dict[str, float]]
+) -> None:
+    """Record interval timer/count deltas and absolute occupancy snapshots.
+
+    Rank IDs come from worker initialization. The bounded key maps determine
+    every other label; unknown fields cannot create metric names or labels.
+    Validate the whole frame before updating counters so a bad later sample
+    cannot leave a partly counted interval that is unsafe to retry.
+    """
+    values = []
+    known = _EXECUTOR_TIMING_STAGES | _EXECUTOR_OPERATION_KINDS | _EXECUTOR_GAUGES
+    for rank, sample in samples.items():
+        if type(rank) is not int or rank < 0:
+            raise ValueError("Executor statistic rank must be a nonnegative integer")
+        for key, value in sample.items():
+            if key not in known:
+                continue
+            if (
+                type(value) not in (int, float)
+                or not isfinite(value)
+                or value < 0
+                or (key == "selective_enabled" and value not in (0, 1))
+            ):
+                raise ValueError(f"Invalid executor statistic {key!r} for rank {rank}")
+            values.append((str(rank), key, value))
+
+    for rank_label, key, value in values:
+        if key in _EXECUTOR_TIMING_STAGES:
+            stats.increase_counter(
+                _ExecutorMetricName.TIME,
+                value,
+                (rank_label, _EXECUTOR_TIMING_STAGES[key]),
+            )
+        elif key in _EXECUTOR_OPERATION_KINDS:
+            stats.increase_counter(
+                _ExecutorMetricName.OPERATIONS,
+                value,
+                (rank_label, _EXECUTOR_OPERATION_KINDS[key]),
+            )
+        else:
+            stats.set_gauge(_EXECUTOR_GAUGES[key], value, (rank_label,))
+
+
 def get_connector_metric_definitions() -> dict[str, OffloadingMetricMetadata]:
     return {
+        **get_executor_metric_definitions(),
         _TransferMetricName.LOAD_BYTES: OffloadingCounterMetadata(
             documentation="Total bytes loaded from offload storage to GPU.",
         ),

@@ -84,6 +84,7 @@ class OffloadingWorkerMetadata(KVConnectorWorkerMetadata):
 
     completed_jobs: dict[int, int] = field(default_factory=dict)
     transfer_stats: TransferStats = field(default_factory=TransferStats)
+    executor_stats: dict[int, dict[str, float]] = field(default_factory=dict)
 
     def mark_completed(self, job_id: int) -> None:
         """Record a transfer job completion from this worker."""
@@ -93,6 +94,11 @@ class OffloadingWorkerMetadata(KVConnectorWorkerMetadata):
         self, other: "KVConnectorWorkerMetadata"
     ) -> "KVConnectorWorkerMetadata":
         assert isinstance(other, OffloadingWorkerMetadata)
+        duplicate_ranks = self.executor_stats.keys() & other.executor_stats.keys()
+        if duplicate_ranks:
+            raise ValueError(
+                f"Duplicate executor statistics for ranks {sorted(duplicate_ranks)}"
+            )
 
         merged = dict(self.completed_jobs)
         for job_id, v in other.completed_jobs.items():
@@ -101,4 +107,8 @@ class OffloadingWorkerMetadata(KVConnectorWorkerMetadata):
         return OffloadingWorkerMetadata(
             completed_jobs=merged,
             transfer_stats=self.transfer_stats.aggregate(other.transfer_stats),
+            executor_stats={
+                rank: dict(sample)
+                for rank, sample in (self.executor_stats | other.executor_stats).items()
+            },
         )

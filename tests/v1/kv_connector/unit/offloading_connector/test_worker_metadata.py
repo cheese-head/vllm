@@ -51,3 +51,35 @@ def test_aggregate_transfer_stats():
     assert result.transfer_stats.load.bytes == 30
     assert result.transfer_stats.load.time == 1.5
     assert result.transfer_stats.load.sizes == [10, 20, 30]
+
+
+def test_aggregate_executor_samples_keeps_ranks_and_owns_nested_snapshots():
+    first = OffloadingWorkerMetadata(
+        completed_jobs={42: 1}, executor_stats={0: {"queue_seconds": 0.1}}
+    )
+    second = OffloadingWorkerMetadata(
+        completed_jobs={42: 1}, executor_stats={1: {"queue_seconds": 0.2}}
+    )
+    merged = first.aggregate(second)
+    assert merged.completed_jobs == {42: 2}
+    assert merged.executor_stats == {
+        0: {"queue_seconds": 0.1},
+        1: {"queue_seconds": 0.2},
+    }
+    first.executor_stats[0]["queue_seconds"] = 99.0
+    second.executor_stats[1].clear()
+    assert merged.executor_stats[0]["queue_seconds"] == 0.1
+    assert merged.executor_stats[1]["queue_seconds"] == 0.2
+
+
+def test_aggregate_executor_samples_rejects_duplicate_rank_without_double_count():
+    first = OffloadingWorkerMetadata(
+        completed_jobs={42: 1}, executor_stats={0: {"accepted_jobs": 2.0}}
+    )
+    second = OffloadingWorkerMetadata(
+        completed_jobs={42: 1}, executor_stats={0: {"accepted_jobs": 3.0}}
+    )
+    with pytest.raises(ValueError, match="Duplicate executor statistics"):
+        first.aggregate(second)
+    assert first.completed_jobs == second.completed_jobs == {42: 1}
+    assert first.executor_stats == {0: {"accepted_jobs": 2.0}}

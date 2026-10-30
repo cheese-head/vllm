@@ -37,6 +37,10 @@ from vllm.v1.kv_offload.cpu.swap_blocks_triton import (
     THRESHOLD_BYTES,
     swap_blocks_batch,
 )
+from vllm.v1.kv_offload.cpu.transfer_lifecycle import (
+    CapturedStoreIntent,
+    capture_store_intent,
+)
 
 logger = init_logger(__name__)
 _RETAINED_NATIVE_CPU_WORKERS: list[object] = []
@@ -823,6 +827,11 @@ class CPUOffloadingWorker(OffloadingWorker):
         # it after both transfer directions have stopped.
         self._mmap_region = mmap_region
         self._copy_executor = None
+        self._lifecycle_mode = (
+            copy_executor_config.lifecycle_mode if copy_executor_config else "legacy"
+        )
+        self._capture_seconds = 0.0
+        self._intent_submit_seconds = 0.0
         pin_memory = PIN_MEMORY
         logger.info("Allocating %d CPU tensors...", len(kv_caches.tensors))
         if mmap_region is not None and pin_memory:
@@ -904,7 +913,8 @@ class CPUOffloadingWorker(OffloadingWorker):
                 copy_executor_config,
             )
 
-    def _enqueue(self, job_id, direction, src_spec, dst_spec):
+    @staticmethod
+    def _snapshot_specs(src_spec, dst_spec):
         if not isinstance(src_spec, BlockIDsLoadStoreSpec) or not isinstance(
             dst_spec, BlockIDsLoadStoreSpec
         ):
@@ -917,13 +927,60 @@ class CPUOffloadingWorker(OffloadingWorker):
             if isinstance(spec, GPULoadStoreSpec):
                 spec.group_sizes = tuple(spec.group_sizes)
                 spec.block_indices = tuple(spec.block_indices)
-        producer = torch.Event()
-        producer.record(current_platform.current_stream())
         charge = source.block_ids.nbytes + target.block_ids.nbytes
-        gpu = source if direction == "store" else target
+        gpu = source if isinstance(source, GPULoadStoreSpec) else target
         if not isinstance(gpu, GPULoadStoreSpec):
             raise TypeError("Native CPU copies require GPU group coordinates")
         charge += 8 * (len(gpu.group_sizes) + len(gpu.block_indices))
+        return source, target, charge
+
+    @staticmethod
+    def capture_store_dependency():
+        producer = torch.Event()
+        producer.record(current_platform.current_stream())
+        return producer
+
+    def store_lifecycle_mode(self) -> str:
+        return getattr(self, "_lifecycle_mode", "legacy")
+
+    def store_lifecycle_limits(self) -> tuple[int, int]:
+        assert self._copy_executor is not None
+        config = self._copy_executor.config
+        return config.max_pending_jobs, config.max_pending_bytes
+
+    def capture_store(self, job_id, src_spec, dst_spec, producer):
+        if not isinstance(src_spec, GPULoadStoreSpec):
+            raise TypeError("Captured stores require a GPU source")
+        start = time.perf_counter()
+        intent = capture_store_intent(
+            job_id,
+            src_spec,
+            dst_spec,
+            snapshot_specs=self._snapshot_specs,
+            capture_producer=lambda: producer,
+        )
+        self._capture_seconds += time.perf_counter() - start
+        return intent
+
+    def submit_store_intent(self, intent: CapturedStoreIntent) -> bool:
+        assert self._copy_executor is not None
+        start = time.perf_counter()
+        self._copy_executor.submit(
+            intent.job_id,
+            "store",
+            ("store", intent.src_spec, intent.dst_spec),
+            intent.producer,
+            intent.metadata_bytes,
+        )
+        self._intent_submit_seconds += time.perf_counter() - start
+        return True
+
+    def _enqueue(self, job_id, direction, src_spec, dst_spec):
+        source, target, charge = self._snapshot_specs(src_spec, dst_spec)
+        gpu = source if direction == "store" else target
+        if not isinstance(gpu, GPULoadStoreSpec):
+            raise TypeError("Transfer direction does not match GPU coordinates")
+        producer = self.capture_store_dependency()
         assert self._copy_executor is not None
         self._copy_executor.submit(
             job_id, direction, (direction, source, target), producer, charge
@@ -970,7 +1027,13 @@ class CPUOffloadingWorker(OffloadingWorker):
 
     def get_executor_statistics(self):
         executor = self._copy_executor
-        return executor.statistics() if executor is not None else {}
+        if executor is None:
+            return {}
+        return dict(
+            executor.statistics(),
+            capture_seconds=getattr(self, "_capture_seconds", 0.0),
+            intent_submit_seconds=getattr(self, "_intent_submit_seconds", 0.0),
+        )
 
     def shutdown(self) -> None:
         executor = getattr(self, "_copy_executor", None)

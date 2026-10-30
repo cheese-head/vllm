@@ -26,6 +26,7 @@ from vllm.distributed.kv_transfer.kv_connector.v1.offloading.metrics import (
     OffloadingConnectorStats,
     _ConnectorMetricName,
     _TransferMetricName,
+    record_executor_statistics,
 )
 from vllm.logger import init_logger
 from vllm.utils.math_utils import cdiv, round_down
@@ -1300,12 +1301,17 @@ class OffloadingConnectorScheduler:
                         for grp_idx in self._sliding_window_groups
                     )
                 req_status.update_block_id_groups(new_block_id_groups)
-                for group_config in self.config.kv_group_configs:
-                    new_blocks = new_block_id_groups[group_config.group_idx]
+                # Packed storage is shared across every manager group, including
+                # non-offloaded scratch groups. Their allocations can reuse an
+                # offload source and must participate in the pre-write fence.
+                for new_blocks in new_block_id_groups:
                     for bid in new_blocks:
                         if bid != 0:
                             self._current_batch_allocated_block_ids.add(bid)
 
+        self._current_batch_allocated_block_ids.update(
+            bid for bid in (scheduler_output.new_block_ids_to_zero or ()) if bid != 0
+        )
         for copy in scheduler_output.kv_cache_block_copies or ():
             self._current_batch_allocated_block_ids.add(copy.dst_block_id)
 
@@ -1948,6 +1954,9 @@ class OffloadingConnectorScheduler:
                         _TransferMetricName.STORE_SIZE, size
                     )
             self._connector_stats.aggregate(transfer_stats)
+
+        if meta.executor_stats:
+            record_executor_statistics(self._connector_stats, meta.executor_stats)
 
         for job_id, count in meta.completed_jobs.items():
             assert count > 0
