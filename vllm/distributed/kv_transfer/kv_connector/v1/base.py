@@ -314,6 +314,10 @@ class KVConnectorBase_V1(ABC):
         """
         return
 
+    def record_load_destination_ready(self, metadata: KVConnectorMetadata) -> None:
+        """Record destination readiness after cache preparation, before forward."""
+        return
+
     @abstractmethod
     def start_load_kv(self, forward_context: "ForwardContext", **kwargs: Any) -> None:
         """Start loading the KV cache from the connector to vLLM's paged
