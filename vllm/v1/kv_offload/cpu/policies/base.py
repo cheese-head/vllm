@@ -55,6 +55,14 @@ class CachePolicy(ABC):
     def __init__(self, cache_capacity: int) -> None:
         self.cache_capacity = cache_capacity
 
+    def record_parent(self, key: OffloadKey, parent: OffloadKey | None) -> None:
+        """Record optional full-attention lineage before admission."""
+        return None
+
+    def filter_admissible(self, keys: list[OffloadKey]) -> list[OffloadKey]:
+        """Return keys that this policy can admit while preserving its invariants."""
+        return keys
+
     @abstractmethod
     def get(self, key: OffloadKey) -> ChunkStatus | None:
         """Find chunk in data structures. Returns None if not present."""

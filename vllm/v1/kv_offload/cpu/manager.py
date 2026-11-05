@@ -41,6 +41,7 @@ class _RequestCacheAccess:
     inserted_keys: set[OffloadKey] = field(default_factory=set)
     reused_keys: set[OffloadKey] = field(default_factory=set)
     store_miss_keys: set[OffloadKey] = field(default_factory=set)
+    eviction_miss_keys: set[OffloadKey] = field(default_factory=set)
     finished: bool = False
 
 
@@ -77,6 +78,16 @@ class CPUOffloadingManager(OffloadingManager):
         self._num_evictable_cache_chunks: int = 0
         # Track chunks with an in-flight store (ref_cnt -1, not yet completed).
         self._num_write_pending_chunks: int = 0
+        self._store_allocation_failures = 0
+        self._evicted_chunks = 0
+        # Exact, bounded evidence that a key was previously resident here.
+        self._recent_evictions: OrderedDict[OffloadKey, None] = OrderedDict()
+        self._max_recent_evictions = 64_000
+        self._misses_after_eviction = 0
+        self._invalidated_chunks = 0
+        self._pending_invalidations: dict[OffloadKey, tuple[int, int]] = {}
+        self._residency_generations: dict[OffloadKey, int] = {}
+        self._next_residency_generation = 0
 
         self.store_threshold: int = store_threshold
         self.max_tracker_size: int = max_tracker_size
@@ -93,6 +104,21 @@ class CPUOffloadingManager(OffloadingManager):
 
     def _get_num_free_chunks(self) -> int:
         return len(self._free_list) + self._num_chunks - self._num_allocated_chunks
+
+    def resident_keys(self) -> set[OffloadKey]:
+        chunks = getattr(self._policy, "chunks", None)
+        if chunks is None:
+            raise ValueError("This cache policy does not expose resident keys")
+        return set(chunks)
+
+    def evictable_keys(self) -> list[OffloadKey]:
+        chunks = getattr(self._policy, "chunks", None)
+        if chunks is None:
+            raise ValueError("This cache policy does not expose evictable keys")
+        return [key for key, chunk in chunks.items() if chunk.ref_cnt == 0]
+
+    def residency_generation(self, key: OffloadKey) -> int:
+        return self._residency_generations[key]
 
     def _allocate_chunks(self, keys: list[OffloadKey]) -> list[ChunkStatus]:
         num_fresh = min(len(keys), self._num_chunks - self._num_allocated_chunks)
@@ -189,6 +215,11 @@ class CPUOffloadingManager(OffloadingManager):
     def lookup(self, key: OffloadKey, req_context: ReqContext) -> LookupResult:
         chunk = self._policy.get(key)
         if chunk is None:
+            if key in self._recent_evictions:
+                state = self._get_request_cache_access(req_context)
+                if key not in state.eviction_miss_keys:
+                    state.eviction_miss_keys.add(key)
+                    self._misses_after_eviction += 1
             return LookupResult.MISS
         if not chunk.is_ready:
             return LookupResult.HIT_PENDING
@@ -199,6 +230,10 @@ class CPUOffloadingManager(OffloadingManager):
         self, key: OffloadKey, req_context: ReqContext
     ) -> CacheHitSource:
         return CacheHitSource.HOST
+
+    def was_recently_evicted(self, key: OffloadKey) -> bool:
+        """Whether this exact key is in the bounded CPU eviction history."""
+        return key in self._recent_evictions
 
     @override
     def prepare_load(
@@ -246,12 +281,44 @@ class CPUOffloadingManager(OffloadingManager):
             if chunk.ref_cnt == 0:
                 self._num_evictable_cache_chunks += 1  # ref_cnt 1 -> 0
                 self._policy.mark_evictable(key)
+                expected = self._pending_invalidations.get(key)
+                if expected is not None:
+                    self.invalidate_if_unpinned(key, *expected)
+
+    def invalidate_if_unpinned(
+        self, key: OffloadKey, chunk_id: int, generation: int
+    ) -> bool:
+        """Retire a confirmed primary copy only if its source slot still matches."""
+        chunk = self._policy.get(key)
+        if (
+            chunk is None
+            or chunk.chunk_id != chunk_id
+            or self._residency_generations.get(key) != generation
+        ):
+            self._pending_invalidations.pop(key, None)
+            return False
+        if not chunk.is_ready or chunk.ref_cnt > 0:
+            self._pending_invalidations[key] = (chunk_id, generation)
+            return False
+        self._pending_invalidations.pop(key, None)
+        self._residency_generations.pop(key, None)
+        self._policy.remove(key)
+        self._num_evictable_cache_chunks -= 1
+        self._invalidated_chunks += 1
+        self._free_chunk(chunk)
+        if self.events is not None:
+            self.events.append(
+                OffloadingEvent(keys=[key], medium=self.medium, removed=True)
+            )
+        return True
 
     @override
     def prepare_store(
         self,
         keys: Collection[OffloadKey],
         req_context: ReqContext,
+        *,
+        protected_keys: Collection[OffloadKey] = (),
     ) -> PrepareStoreOutput | None:
         keys = list(keys)
         if self.counts is not None:
@@ -279,6 +346,10 @@ class CPUOffloadingManager(OffloadingManager):
             self.stores_skipped_in_current_batch += num_store_candidates - len(
                 keys_to_store
             )
+
+        for key in keys:
+            self._policy.record_parent(key, req_context.get_offload_key_parent(key))
+        keys_to_store = self._policy.filter_admissible(keys_to_store)
 
         state = self._get_request_cache_access(req_context)
         new_store_misses = [
@@ -314,15 +385,17 @@ class CPUOffloadingManager(OffloadingManager):
         if num_chunks_to_evict > 0:
             if num_chunks_to_evict > self._num_evictable_cache_chunks:
                 # Eviction will fail.
+                self._store_allocation_failures += 1
                 return None
             # There is a still a chance for eviction failure as some of the
             # idle chunks might be in the protected list.
 
             # Chunks from the original input are excluded from eviction candidates:
             # a chunk that was already stored must remain in the cache after this call.
-            protected = set(keys)
+            protected = set(keys) | set(protected_keys)
             evicted = self._policy.evict(num_chunks_to_evict, protected)
             if evicted is None:
+                self._store_allocation_failures += 1
                 return None
 
             # cache-policy removes only idle chunks.
@@ -331,7 +404,14 @@ class CPUOffloadingManager(OffloadingManager):
 
             for key, chunk in evicted:
                 self._free_chunk(chunk)
+                self._pending_invalidations.pop(key, None)
+                self._residency_generations.pop(key, None)
                 to_evict.append(key)
+                self._recent_evictions[key] = None
+                self._recent_evictions.move_to_end(key)
+                if len(self._recent_evictions) > self._max_recent_evictions:
+                    self._recent_evictions.popitem(last=False)
+            self._evicted_chunks += len(evicted)
 
         if to_evict and self.events is not None:
             self.events.append(
@@ -349,6 +429,9 @@ class CPUOffloadingManager(OffloadingManager):
 
         for key, chunk in zip(keys_to_store, chunks):
             self._policy.insert(key, chunk)
+            self._next_residency_generation += 1
+            self._residency_generations[key] = self._next_residency_generation
+            self._recent_evictions.pop(key, None)
         self._num_write_pending_chunks += len(keys_to_store)
         state.inserted_keys.update(keys_to_store)
 
@@ -380,11 +463,13 @@ class CPUOffloadingManager(OffloadingManager):
                     self._policy.mark_evictable(key)
                     stored_keys.append(key)
         else:
-            for key in keys:
+            for key in reversed(list(keys)):
                 chunk = self._policy.get(key)
                 if chunk is not None and not chunk.is_ready:
                     self._num_write_pending_chunks -= 1
                     self._policy.remove(key)
+                    self._pending_invalidations.pop(key, None)
+                    self._residency_generations.pop(key, None)
                     self._free_chunk(chunk)
 
         if stored_keys and self.events is not None:
@@ -439,6 +524,9 @@ class CPUOffloadingManager(OffloadingManager):
 
         self._free_list.clear()
         self._num_allocated_chunks = 0
+        self._recent_evictions.clear()
+        self._pending_invalidations.clear()
+        self._residency_generations.clear()
 
     @override
     def take_events(self) -> Iterable[OffloadingEvent]:
@@ -448,6 +536,44 @@ class CPUOffloadingManager(OffloadingManager):
 
     def get_stats(self) -> OffloadingConnectorStats | None:
         stats = OffloadingConnectorStats()
+
+        free = self._get_num_free_chunks()
+        resident = self._num_allocated_chunks - len(self._free_list)
+        for state, count in (
+            ("free", free),
+            ("evictable", self._num_evictable_cache_chunks),
+            ("write_pending", self._num_write_pending_chunks),
+            (
+                "read_pinned",
+                resident
+                - self._num_evictable_cache_chunks
+                - self._num_write_pending_chunks,
+            ),
+        ):
+            stats.set_gauge(CPUOffloadingMetrics.CPU_CACHE_SLOTS, count, (state,))
+        if self._store_allocation_failures:
+            stats.increase_counter(
+                CPUOffloadingMetrics.CPU_STORE_ALLOCATION_FAILURES,
+                self._store_allocation_failures,
+            )
+            self._store_allocation_failures = 0
+        if self._evicted_chunks:
+            stats.increase_counter(
+                CPUOffloadingMetrics.CPU_EVICTED_CHUNKS, self._evicted_chunks
+            )
+            self._evicted_chunks = 0
+        if self._invalidated_chunks:
+            stats.increase_counter(
+                CPUOffloadingMetrics.CPU_INVALIDATED_CHUNKS,
+                self._invalidated_chunks,
+            )
+            self._invalidated_chunks = 0
+        if self._misses_after_eviction:
+            stats.increase_counter(
+                CPUOffloadingMetrics.CPU_MISSES_AFTER_EVICTION,
+                self._misses_after_eviction,
+            )
+            self._misses_after_eviction = 0
 
         # Compute cache usage.
         num_used = (

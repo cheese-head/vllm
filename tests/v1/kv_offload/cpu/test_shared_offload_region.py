@@ -25,6 +25,28 @@ from vllm.v1.kv_offload.cpu.shared_offload_region import (
 PAGE_SIZE = mmap.PAGESIZE
 
 
+def test_numa_population_rejects_worker_region_before_allocation():
+    with pytest.raises(ValueError, match="scheduler-side region"):
+        SharedOffloadRegion(
+            engine_id="invalid-numa-worker",
+            num_chunks=1,
+            rank=0,
+            kv_bytes_per_chunk=PAGE_SIZE,
+            cpu_page_size=PAGE_SIZE,
+            numa_nodes=[0],
+        )
+
+
+def test_numa_population_rejects_nodes_outside_cpuset(monkeypatch):
+    from vllm.v1.kv_offload.cpu import numa
+
+    monkeypatch.setattr(numa.Path, "is_dir", lambda _: True)
+    monkeypatch.setattr(numa.Path, "exists", lambda _: True)
+    monkeypatch.setattr(numa.Path, "read_text", lambda _: "Mems_allowed_list:\t0-1\n")
+    with pytest.raises(ValueError, match="excluded by cpuset"):
+        numa.validate_numa_nodes([2])
+
+
 # ---------------------------------------------------------------------------
 # Helpers / fixtures
 # ---------------------------------------------------------------------------
