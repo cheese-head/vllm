@@ -2448,6 +2448,23 @@ def generate_scheduler_kv_cache_config(
     # All workers have the same kv_cache_config except layer names, so use
     # an arbitrary one to initialize the scheduler.
     cfg = copy.deepcopy(kv_cache_configs[0])
+    if any(
+        len(c.kv_cache_groups) != len(cfg.kv_cache_groups) for c in kv_cache_configs
+    ):
+        raise ValueError("Workers must preserve global KV cache group indices")
+
+    def group_bytes(group: KVCacheGroupSpec) -> int:
+        spec = group.kv_cache_spec
+        if isinstance(spec, UniformTypeKVCacheSpecs):
+            return spec.page_size_bytes
+        return spec.page_size_bytes * len(group.layer_names)
+
+    # Flattening below is lossy for heterogeneous layer page sizes. Retain a
+    # per-group reservation bound, including TP/PP workers with different layers.
+    cfg.group_page_size_bytes = tuple(
+        max(group_bytes(c.kv_cache_groups[i]) for c in kv_cache_configs)
+        for i in range(len(cfg.kv_cache_groups))
+    )
     for group in cfg.kv_cache_groups:
         if isinstance(group.kv_cache_spec, UniformTypeKVCacheSpecs):
             # All layers in the UniformTypeKVCacheSpecs have the same type,

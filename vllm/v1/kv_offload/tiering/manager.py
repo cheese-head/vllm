@@ -95,16 +95,20 @@ class CPUPrimaryTierOffloadingManager(CPUOffloadingManager):
     def __init__(
         self,
         num_chunks: int,
-        mmap_region: SharedOffloadRegion,
+        mmap_region: SharedOffloadRegion | None,
         cache_policy: str = "lru",
         cache_policy_module_path: str | None = None,
         enable_events: bool = False,
+        incremental_recency: bool = False,
+        compact_group_units: dict[int, int] | None = None,
     ):
         super().__init__(
             num_chunks=num_chunks,
             cache_policy=cache_policy,
             cache_policy_module_path=cache_policy_module_path,
             enable_events=enable_events,
+            incremental_recency=incremental_recency,
+            compact_group_units=compact_group_units,
         )
         self._mmap_region = mmap_region
         # read/write is for CPU<->secondary transfers,
@@ -114,7 +118,9 @@ class CPUPrimaryTierOffloadingManager(CPUOffloadingManager):
         self.prepare_write = self.prepare_store
         self.complete_write = self.complete_store
 
-        self._kv_memoryview = mmap_region.create_kv_memoryview()
+        self._kv_memoryview = (
+            mmap_region.create_kv_memoryview() if mmap_region is not None else None
+        )
 
     def prepare_read(
         self, keys: Collection[OffloadKey], req_context: ReqContext
@@ -133,13 +139,19 @@ class CPUPrimaryTierOffloadingManager(CPUOffloadingManager):
         SharedOffloadRegion mmap.  Secondary tiers address chunk *c* as
         ``view[c]``.
         """
+        if self._kv_memoryview is None:
+            raise ValueError(
+                "Private compact banks cannot be exposed to secondary tiers"
+            )
         return self._kv_memoryview
 
     @override
     def shutdown(self) -> None:
         super().shutdown()
-        self._kv_memoryview.release()
-        self._mmap_region.cleanup()
+        if self._kv_memoryview is not None:
+            self._kv_memoryview.release()
+        if self._mmap_region is not None:
+            self._mmap_region.cleanup()
 
 
 class _SecondaryTierFacingParent(ParentManager):
@@ -192,6 +204,8 @@ class TieringOffloadingManager(OffloadingManager):
         self,
         primary_tier: CPUPrimaryTierOffloadingManager,
         secondary_tiers: list[SecondaryTierManager] | None = None,
+        *,
+        primary_chunk_size_bytes: int | None = None,
     ):
         """Initialize the TieringOffloadingManager.
 
@@ -199,6 +213,8 @@ class TieringOffloadingManager(OffloadingManager):
             primary_tier: The primary tier manager (CPU-based).
             secondary_tiers: List of secondary tier managers (e.g., Storage,
                             Network). Can be None or empty list.
+            primary_chunk_size_bytes: aggregate compact page size when no mmap
+                is exposed; only valid for a CPU-only tier stack.
 
         """
         self.primary_tier: CPUPrimaryTierOffloadingManager = primary_tier
@@ -210,12 +226,16 @@ class TieringOffloadingManager(OffloadingManager):
         #   True:  secondary → primary (promotion)
         #   False: primary → secondary (cascade)
         self._jobs: dict[JobId, JobMetadata] = {}
-        primary_view = self.primary_tier.get_kv_memoryview()
-        assert primary_view.strides is not None
+        if primary_chunk_size_bytes is None:
+            primary_view = self.primary_tier.get_kv_memoryview()
+            assert primary_view.strides is not None
+            primary_chunk_size_bytes = primary_view.strides[0]
+        elif self.secondary_tiers or primary_chunk_size_bytes <= 0:
+            raise ValueError("Private compact metrics require positive CPU-only pages")
         self._metrics = TieringMetricsTracker(
             tier_types=[tier.tier_type for tier in self.secondary_tiers],
             num_primary_chunks=self.primary_tier._num_chunks,
-            primary_chunk_size=primary_view.strides[0],
+            primary_chunk_size=primary_chunk_size_bytes,
         )
 
         # Pending promotion requests accumulated during lookup() calls; flushed

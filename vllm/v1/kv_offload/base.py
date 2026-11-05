@@ -104,7 +104,6 @@ class ReqContext:
     _offload_key_positions: dict[OffloadKey, int] = field(
         default_factory=dict, repr=False, init=False
     )
-
     _offload_key_parents: dict[OffloadKey, OffloadKey] = field(
         default_factory=dict, repr=False, init=False
     )
@@ -547,6 +546,9 @@ class CanonicalKVCacheRef:
     page_size_bytes: int
     # How this worker's page maps into a canonical page; None = uncertified
     mapping: CanonicalPageMapping | None = None
+    # Direct compact layouts use distinct GPU and CPU byte coordinates.
+    gpu_offset_bytes: int = 0
+    host_offset_bytes: int = 0
 
 
 @dataclass
@@ -566,6 +568,8 @@ class CanonicalKVCaches:
     # Per-KV-cache-group list of data references that map each layer
     # in the group to the appropriate entry in the tensors list.
     group_data_refs: list[list[CanonicalKVCacheRef]]
+    compact_page_size_bytes: int | None = None
+    compact_group_page_sizes: tuple[int, ...] | None = None
 
 
 @dataclass

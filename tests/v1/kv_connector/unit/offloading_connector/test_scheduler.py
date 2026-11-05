@@ -5027,3 +5027,82 @@ class TestMambaHybridOffloadServing:
             False,
         ]
         assert self._roundtrip_served_tokens(scheduler) == 16
+
+
+@pytest.mark.parametrize("worker_count", [1, 8])
+@pytest.mark.parametrize("retention_interval", [None, 48])
+@pytest.mark.parametrize("blocks_per_chunk", [1, 3])
+@pytest.mark.parametrize("hybrid", [False, True])
+def test_incremental_store_preserves_transfer_trace(
+    worker_count, retention_interval, blocks_per_chunk, hybrid
+):
+    """Same request events must emit the same jobs, including finish and retries."""
+    traces = []
+    for enabled in [False, True]:
+        config = _make_vllm_config(
+            tensor_parallel_size=worker_count,
+            extra_config={
+                "blocks_per_chunk": blocks_per_chunk,
+                "offload_prompt_only": False,
+                "cpu_perf": {"incremental_store": enabled},
+            },
+        )
+        config.speculative_config = None
+        config.cache_config.block_size = 4
+        config.cache_config.prefix_cache_retention_interval = retention_interval
+        kwargs = dict(block_size=4, num_kv_heads=1, head_size=1, dtype=torch.float32)
+        groups = [KVCacheGroupSpec(["full"], FullAttentionSpec(**kwargs))]
+        if hybrid:
+            groups.append(
+                KVCacheGroupSpec(["swa"], SlidingWindowSpec(**kwargs, sliding_window=8))
+            )
+        cache = KVCacheConfig(
+            num_blocks=128, kv_cache_tensors=[], kv_cache_groups=groups
+        )
+        spec = MockOffloadingSpec(build_offloading_config(config, cache))
+        scheduler = OffloadingConnectorScheduler(spec, config, cache)
+        spec.manager.prepare_store.side_effect = lambda keys, context: (
+            generate_store_output(list(keys))
+        )
+        request = MagicMock()
+        request.request_id = "request"
+        request.num_prompt_tokens = request.num_tokens = 48
+        request.kv_transfer_params = request.kv_hints = request.lora_request = None
+        request.shared_prefix_boundary = None
+        request.is_finished.return_value = False
+        request.status = RequestStatus.RUNNING
+        request.block_hashes = [BlockHash(str(i).encode()) for i in range(12)]
+        request.all_token_ids = list(range(100))
+        scheduler.on_new_request(request)
+        state = scheduler._req_status["request"]
+        for group in state.group_states:
+            group.block_ids = list(range(1, 65))
+        trace = []
+        for step in range(42):
+            request.num_tokens = 49 + step
+            request.num_computed_tokens = 48 + step
+            request.block_hashes = [
+                BlockHash(str(i).encode()) for i in range(request.num_tokens // 4)
+            ]
+            state.update_offload_keys()
+            if step == 41:
+                request.is_finished.return_value = True
+                request.status = RequestStatus.FINISHED_LENGTH_CAPPED
+            output = SimpleNamespace(
+                num_scheduled_tokens={"request": 1},
+                finished_req_ids={"request"} if step == 41 else set(),
+            )
+            jobs = scheduler._build_store_jobs(output)
+            trace.append(
+                [
+                    (
+                        job.src_spec.block_ids.tolist(),
+                        job.src_spec.group_sizes,
+                        job.src_spec.block_indices,
+                        list(job.dst_spec.offload_keys),
+                    )
+                    for job in jobs.values()
+                ]
+            )
+        traces.append(trace)
+    assert traces[0] == traces[1]

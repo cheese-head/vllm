@@ -78,6 +78,7 @@ def handler(direction, bpc, canonical, writer, writers=2):
     result.src_blocks_per_chunk = 1 if store else bpc
     result.dst_blocks_per_chunk = bpc if store else 1
     result.gpu_to_cpu = store
+    result._compact_group_page_sizes = None
     result._canonical_copy_plans = (
         [
             [_build_copy_plan(ref, store) for ref in refs]
@@ -94,6 +95,7 @@ def handler(direction, bpc, canonical, writer, writers=2):
     return result
 
 
+@pytest.mark.parametrize("precise_batching", [False, True])
 @pytest.mark.parametrize("direction", ["store", "load"])
 @pytest.mark.parametrize("bpc", [1, 3])
 @pytest.mark.parametrize(
@@ -116,6 +118,7 @@ def handler(direction, bpc, canonical, writer, writers=2):
     ],
 )
 def test_split_descriptors_match_unsplit_native_layout(
+    precise_batching,
     direction,
     bpc,
     canonical,
@@ -134,8 +137,7 @@ def test_split_descriptors_match_unsplit_native_layout(
     gpu = GPULoadStoreSpec(gpu_ids, groups, indices)
     cpu = CPULoadStoreSpec(cpu_ids)
     source, target = (gpu, cpu) if direction == "store" else (cpu, gpu)
-    backend = CudaCopyBackend.__new__(CudaCopyBackend)
-    backend.handlers = {direction: h}
+    backend = CudaCopyBackend(h, h, None, precise_batching=precise_batching)
     chunks = list(
         backend.chunks(
             (direction, source, target),
@@ -267,6 +269,7 @@ def test_physical_statistics_and_logical_acknowledgments_are_independent():
     from vllm.v1.kv_offload.base import TransferResult
 
     worker = OffloadingConnectorWorker.__new__(OffloadingConnectorWorker)
+    worker._next_executor_report = float("inf")
     worker.worker = MagicMock()
     worker._load_jobs = {10: "request"}
     worker._connector_worker_meta = OffloadingWorkerMetadata()
@@ -431,3 +434,105 @@ def test_executor_moves_data_only_after_producer_and_before_completion(
     finally:
         producer.done = True
         executor.close()
+
+
+@pytest.mark.parametrize("early", [False, True])
+def test_load_dependency_uses_prepared_destination_and_preserves_store_producer(
+    monkeypatch, early
+):
+    from vllm.v1.kv_offload.cpu.perf import CPUPerfConfig
+
+    worker = CPUOffloadingWorker.__new__(CPUOffloadingWorker)
+    worker._perf = CPUPerfConfig(early_load_ready=early)
+    worker._load_destination_ready = None
+    worker._copy_executor = MagicMock()
+    events = iter([object(), object(), object()])
+    monkeypatch.setattr(worker, "capture_store_dependency", lambda: next(events))
+    if early:
+        with pytest.raises(RuntimeError, match="destination preparation"):
+            worker.submit_load(
+                0, CPULoadStoreSpec([1]), GPULoadStoreSpec([2], [1], [0])
+            )
+    worker.record_load_destination_ready()
+    prepared = worker._load_destination_ready
+    worker.submit_load(1, CPULoadStoreSpec([1]), GPULoadStoreSpec([2], [1], [0]))
+    load_event = worker._copy_executor.submit.call_args.args[3]
+    worker.submit_store(2, GPULoadStoreSpec([2], [1], [0]), CPULoadStoreSpec([1]))
+    store_event = worker._copy_executor.submit.call_args.args[3]
+    assert (load_event is prepared) == early
+    assert store_event is not load_event
+
+
+@pytest.mark.parametrize("direction", ["store", "load"])
+@pytest.mark.parametrize("bpc", [1, 3])
+@pytest.mark.parametrize("precise", [False, True])
+def test_compact_descriptors_round_trip_real_cpu_bytes(direction, bpc, precise):
+    from vllm.v1.kv_offload.cpu.perf import packed_group_regions
+
+    gpu = (ctypes.c_ubyte * 4096)(*([17] * 4096))
+    cpu = (ctypes.c_ubyte * 4096)(*([0] * 4096))
+    regions = packed_group_regions([[(8, 8), (32, 8)], [(48, 16)]], 64, 16)
+    h = handler(direction, bpc, False, 0, 1)
+    h.layer_refs_per_group = [
+        [
+            CanonicalKVCacheRef(0, n, gpu_offset_bytes=g, host_offset_bytes=c)
+            for g, c, n in group
+        ]
+        for group in regions
+    ]
+    g = Tensor(ctypes.addressof(gpu), 64, 64)
+    c = Tensor(ctypes.addressof(cpu), 8, 8)
+    h._compact_group_page_sizes = (16, 16)
+    h.src_tensors = [g if direction == "store" else c]
+    h.dst_tensors = [c if direction == "store" else g]
+    h._canonical_copy_plans = None
+    h._fill_group_ops = h._fill_direct_ops
+    backend = CudaCopyBackend(h, h, None, precise_batching=precise)
+    gpu_spec = GPULoadStoreSpec([2, 3, 4, 8, 9, 10], [3, 3], [1, 1])
+    count = (3 + 1 % bpc + bpc - 1) // bpc
+    cpu_spec = CPULoadStoreSpec(
+        [10 + 10 * i for i in range(count)] + [100 + 10 * i for i in range(count)]
+    )
+    if direction == "load":
+        for i in range(4096):
+            cpu[i] = i % 251
+    source, target = (
+        (gpu_spec, cpu_spec) if direction == "store" else (cpu_spec, gpu_spec)
+    )
+    chunks = list(backend.chunks((direction, source, target), CopyExecutorConfig()))
+    before_gpu, before_cpu = bytes(gpu), bytes(cpu)
+    expected = bytearray(before_cpu if direction == "store" else before_gpu)
+    for group, gpu_ids in enumerate(([2, 3, 4], [8, 9, 10])):
+        host_ids = cpu_spec.block_ids[group * count : (group + 1) * count]
+        for index, gpu_id in enumerate(gpu_ids):
+            chunk, subblock = divmod(1 % bpc + index, bpc)
+            for gpu_offset, host_offset, size in regions[group]:
+                gpu_start = gpu_id * 64 + gpu_offset
+                cpu_start = int(host_ids[chunk]) * 8 + subblock * 16 + host_offset
+                if direction == "store":
+                    expected[cpu_start : cpu_start + size] = before_gpu[
+                        gpu_start : gpu_start + size
+                    ]
+                else:
+                    expected[gpu_start : gpu_start + size] = before_cpu[
+                        cpu_start : cpu_start + size
+                    ]
+    for chunk in chunks:
+        for src, dst, n in zip(chunk.data.src, chunk.data.dst, chunk.data.sizes):
+            ctypes.memmove(int(dst), int(src), int(n))
+    assert sum(chunk.nbytes for chunk in chunks) == 96
+    assert bytes(cpu if direction == "store" else gpu) == expected
+
+
+@pytest.mark.parametrize("direction", ["store", "load"])
+def test_empty_rank_group_still_finishes_its_logical_job(direction):
+    h = handler(direction, 1, False, 0, 1)
+    h.layer_refs_per_group[1] = []
+    backend = CudaCopyBackend(h, h, None, precise_batching=True)
+    gpu = GPULoadStoreSpec([2, 3], [1, 1, 0], [0, 0, 0])
+    cpu = CPULoadStoreSpec([1, 2])
+    source, target = (gpu, cpu) if direction == "store" else (cpu, gpu)
+    chunks = list(backend.chunks((direction, source, target), CopyExecutorConfig()))
+    assert chunks[-1].final
+    assert sum(chunk.final for chunk in chunks) == 1
+    assert sum(chunk.nbytes for chunk in chunks) == 128

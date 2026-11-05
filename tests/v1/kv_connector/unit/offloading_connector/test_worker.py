@@ -109,6 +109,7 @@ def _make_worker(
     spec.replicated_layout = replicated_layout
     spec.config = MagicMock()
     spec.config.canonical_layout = canonical_layout
+    spec.config.extra_config = {}
     spec.config.parallel.rank = rank
     spec.get_worker.return_value = MagicMock()
 
@@ -930,3 +931,119 @@ def test_required_selective_registration_cannot_silently_fall_back(
 
     with pytest.raises(RuntimeError, match="selective"):
         worker.register_kv_caches(caches)
+
+
+def test_compact_registration_uses_group_offsets_and_smaller_slots(monkeypatch):
+    from dataclasses import replace
+
+    worker, spec, backend, caches = _cpu_lifecycle_registration(
+        monkeypatch, layout="shared"
+    )
+    group = worker.kv_cache_config.kv_cache_groups[0]
+    worker.kv_cache_config.kv_cache_groups = [
+        KVCacheGroupSpec(["first"], group.kv_cache_spec),
+        KVCacheGroupSpec(["second"], group.kv_cache_spec),
+    ]
+    page = group.kv_cache_spec.page_size_bytes
+    spec.config = replace(
+        spec.config,
+        compact_page_size_bytes=4096,
+        compact_group_page_sizes=(page, page),
+        extra_config={"cpu_perf": {"compact_groups": True}},
+    )
+    worker.register_kv_caches(caches)
+    registered = spec.get_worker.call_args.args[0]
+    assert registered.compact_page_size_bytes == 4096
+    assert registered.compact_group_page_sizes == (page, page)
+    assert registered.tensors[0].page_size_bytes == 2 * page
+    assert [
+        [(r.gpu_offset_bytes, r.host_offset_bytes, r.page_size_bytes) for r in refs]
+        for refs in registered.group_data_refs
+    ] == [[(0, 0, page)], [(page, 0, page)]]
+
+
+def test_compact_registration_rejects_layer_view_crossing_page(monkeypatch):
+    from dataclasses import replace
+
+    worker, spec, backend, caches = _cpu_lifecycle_registration(
+        monkeypatch, layout="shared"
+    )
+    page = worker.kv_cache_config.kv_cache_groups[0].kv_cache_spec.page_size_bytes
+    spec.config = replace(
+        spec.config,
+        compact_page_size_bytes=2 * page,
+        extra_config={"cpu_perf": {"compact_groups": True}},
+    )
+    first = caches["first"]
+    caches["first"] = first.as_strided(first.shape, (first.stride(0), 2))
+    with pytest.raises(ValueError, match="spans outside its page"):
+        worker.register_kv_caches(caches)
+
+
+@pytest.mark.parametrize("layout", [KVCacheLayout.BLNHC, KVCacheLayout.BLHNC])
+@pytest.mark.parametrize("dtype", [torch.float16, torch.bfloat16, torch.float8_e4m3fn])
+@pytest.mark.parametrize("empty_group", [False, True])
+def test_compact_dsv4_like_five_group_alias_layout(
+    monkeypatch, layout, dtype, empty_group
+):
+    """Certify real allocator views on CPU; no model or CUDA state is created."""
+    from dataclasses import replace
+
+    from tests.v1.kv_connector.unit.offloading_connector.test_config import (
+        _make_dsv4_flash_kv_cache_config,
+        _make_vllm_config,
+    )
+    from vllm.distributed.kv_transfer.kv_connector.v1.offloading import worker as module
+    from vllm.distributed.kv_transfer.kv_connector.v1.offloading.config import (
+        build_offloading_config,
+    )
+    from vllm.v1.worker.utils import allocate_kv_cache
+
+    cache = _make_dsv4_flash_kv_cache_config()
+    for group in cache.kv_cache_groups:
+        group.kv_cache_spec = replace(
+            group.kv_cache_spec,
+            kv_cache_specs={
+                name: replace(spec, dtype=dtype)
+                for name, spec in group.kv_cache_spec.kv_cache_specs.items()
+            },
+        )
+    page = next(
+        iter(cache.kv_cache_groups[0].kv_cache_spec.kv_cache_specs.values())
+    ).page_size_bytes
+    row = 2 * page
+    cache.kv_cache_tensors = [
+        KVCacheTensor(
+            size=cache.num_blocks * row,
+            layers=list(group.layer_names),
+            layer_stride=page,
+            block_stride=row,
+        )
+        for group in cache.kv_cache_groups
+    ]
+    config = _make_vllm_config(
+        tensor_parallel_size=8,
+        extra_config={
+            "cpu_bytes_to_use": 1 << 20,
+            "cpu_perf": {"compact_groups": True},
+        },
+    )
+    config.use_v2_model_runner = True
+    caches = allocate_kv_cache(cache, torch.device("cpu"), layout)
+    if empty_group:
+        cache.kv_cache_groups[1].layer_names = []
+    normalized = build_offloading_config(config, cache)
+    worker, spec = _make_worker(cache)
+    worker.vllm_config = config
+    spec.config = normalized
+    spec.get_worker.return_value.store_lifecycle_mode.return_value = "legacy"
+    monkeypatch.setattr(module, "derive_canonical_mappings", lambda *args: {})
+    worker.register_kv_caches(caches)
+    registered = spec.get_worker.call_args.args[0]
+    assert worker._known_packed_layout
+    assert len(registered.group_data_refs) == 5
+    assert registered.compact_page_size_bytes == 4096
+    if empty_group:
+        assert registered.group_data_refs[1] == []
+    for group in registered.group_data_refs:
+        assert all(r.gpu_offset_bytes + r.page_size_bytes <= row for r in group)

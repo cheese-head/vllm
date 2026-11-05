@@ -5,6 +5,7 @@ from typing import Any
 import torch
 from typing_extensions import override
 
+from vllm.logger import init_logger
 from vllm.platforms import current_platform
 from vllm.utils.math_utils import round_up
 from vllm.v1.kv_offload.base import (
@@ -22,7 +23,10 @@ from vllm.v1.kv_offload.cpu.common import CPUOffloadingMetrics
 from vllm.v1.kv_offload.cpu.copy_executor import CopyExecutorConfig
 from vllm.v1.kv_offload.cpu.gpu_worker import CPUOffloadingWorker
 from vllm.v1.kv_offload.cpu.manager import CPUOffloadingManager
+from vllm.v1.kv_offload.cpu.perf import CPUPerfConfig
 from vllm.v1.kv_offload.cpu.shared_offload_region import SharedOffloadRegion
+
+logger = init_logger(__name__)
 
 
 def _all_workers_barrier() -> None:
@@ -80,7 +84,9 @@ class CPUOffloadingSpec(OffloadingSpec):
                 buckets=(1, 4, 16, 64, 256, 1024, 4096, 16384, 65536, 262144),
             ),
             CPUOffloadingMetrics.CPU_CACHE_SLOTS: OffloadingGaugeMetadata(
-                documentation="CPU cache slot counts by state.",
+                documentation=(
+                    "CPU allocation units by state: fixed slots or compact 4KiB pages."
+                ),
                 labelnames=("state",),
             ),
             CPUOffloadingMetrics.CPU_STORE_ALLOCATION_FAILURES: (
@@ -122,6 +128,26 @@ class CPUOffloadingSpec(OffloadingSpec):
         self.copy_executor_config = CopyExecutorConfig.from_extra_config(
             self.extra_config
         )
+        self.perf_config = CPUPerfConfig.from_extra_config(self.extra_config)
+        if (
+            self.perf_config.early_load_ready or self.perf_config.precise_batching
+        ) and self.copy_executor_config is None:
+            raise ValueError(
+                "early_load_ready and precise_batching require cpu_copy_executor"
+            )
+        if self.perf_config.compact_groups and not config.compact_page_size_bytes:
+            raise ValueError("compact_groups requires a resolved compact slot size")
+        if self.perf_config.compact_groups and config.compact_page_size_bytes != 4096:
+            raise ValueError("compact_groups requires 4096-byte allocator pages")
+        logger.info("Native CPU performance flags: %s", self.perf_config)
+        self.compact_group_units = (
+            {
+                group.group_id: max(1, (size * self.blocks_per_chunk + 4095) // 4096)
+                for group, size in zip(config.groups, config.compact_group_page_sizes)
+            }
+            if config.compact_group_page_sizes is not None
+            else None
+        )
 
         cpu_bytes_to_use = self.extra_config.get("cpu_bytes_to_use")
         if not cpu_bytes_to_use:
@@ -136,7 +162,10 @@ class CPUOffloadingSpec(OffloadingSpec):
         self.replicated_layout = config.replicated_layout and self._uses_shared_region()
         if config.worker_kv_bytes_per_block > 0 and world_size > 0:
             num_copies = 1 if self.replicated_layout else world_size
-            kv_bytes_per_block = config.worker_kv_bytes_per_block * num_copies
+            page_bytes = (
+                config.compact_page_size_bytes or config.worker_kv_bytes_per_block
+            )
+            kv_bytes_per_block = page_bytes * num_copies
             kv_bytes_per_chunk = kv_bytes_per_block * self.blocks_per_chunk
 
             # calculate cpu_page_size_per_worker
@@ -154,6 +183,17 @@ class CPUOffloadingSpec(OffloadingSpec):
             # |--- W0-C0---|---- W1-C0---| ... |---- Wn-C0---| *** maybe-pad *** |
             # or |--- C0 (single copy) ---| *** maybe-pad *** |
             self.kv_bytes_per_chunk = aligned_kv_bytes_per_chunk
+        if self.perf_config.compact_groups:
+            assert config.compact_page_size_bytes is not None
+            self.cpu_page_size_per_worker = config.compact_page_size_bytes
+            self.kv_bytes_per_chunk = self.cpu_page_size_per_worker * world_size
+            self.num_chunks = int(cpu_bytes_to_use) // self.kv_bytes_per_chunk
+            logger.info(
+                "Native CPU compact bank pages=%d page_bytes=%d group_units=%s",
+                self.num_chunks,
+                self.cpu_page_size_per_worker,
+                self.compact_group_units,
+            )
 
         # scheduler-side
         self._manager: OffloadingManager | None = None
@@ -185,13 +225,19 @@ class CPUOffloadingSpec(OffloadingSpec):
                 enable_events=self.kv_events_config.enable_kv_cache_events,
                 store_threshold=store_threshold,
                 max_tracker_size=max_tracker_size,
+                incremental_recency=self.perf_config.incremental_recency,
+                compact_group_units=self.compact_group_units,
             )
         return self._manager
 
     def _uses_shared_region(self) -> bool:
         """Whether the worker CPU buffer is the shared mmap region (vs a private
         per-rank tensor); replicated-layout dedup is gated on this being True."""
-        return current_platform.is_cuda_alike() and not current_platform.is_rocm()
+        return (
+            not self.perf_config.compact_groups
+            and current_platform.is_cuda_alike()
+            and not current_platform.is_rocm()
+        )
 
     def create_worker(self, kv_caches: CanonicalKVCaches) -> CPUOffloadingWorker:
         mmap_region: SharedOffloadRegion | None = None
@@ -223,6 +269,7 @@ class CPUOffloadingSpec(OffloadingSpec):
                 num_cpu_chunks=self.num_chunks,
                 mmap_region=mmap_region,
                 copy_executor_config=self.copy_executor_config,
+                perf_config=self.perf_config,
             )
         except Exception:
             if mmap_region is not None:

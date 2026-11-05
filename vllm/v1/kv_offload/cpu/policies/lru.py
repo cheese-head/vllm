@@ -111,6 +111,10 @@ class LRUCachePolicy(CachePolicy):
         self._heap.clear()
         self._next_rank = 0
 
+    def on_request_finished_mru(self, keys: Iterable[OffloadKey]) -> None:
+        """Apply the manager's incremental merge in most-recent-first order."""
+        self._update_recency(keys)
+
     @override
     def evict(
         self, n: int, protected: set[OffloadKey]

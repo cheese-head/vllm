@@ -39,6 +39,7 @@ from vllm.v1.kv_offload.base import (
     OffloadingSpec,
     OffloadingWorker,
 )
+from vllm.v1.kv_offload.cpu.perf import CPUPerfConfig, packed_group_regions
 from vllm.v1.kv_offload.cpu.transfer_lifecycle import (
     CapturedStoreIntent,
     DeferredStoreQueue,
@@ -134,6 +135,7 @@ class OffloadingConnectorWorker:
 
     def register_kv_caches(self, kv_caches: dict[str, torch.Tensor]):
         kv_cache_config = self.kv_cache_config
+        perf = CPUPerfConfig.from_extra_config(self.spec.config.extra_config)
         selected_group_ids = get_offloading_group_ids(kv_cache_config)
         selected_groups = tuple(
             kv_cache_config.kv_cache_groups[group_id] for group_id in selected_group_ids
@@ -165,6 +167,15 @@ class OffloadingConnectorWorker:
                 page = layer_kv_cache_spec.page_size_bytes
                 elem_size = ref.element_size()
                 byte_offset = ref.storage_offset() * elem_size
+                if perf.compact_groups:
+                    span = elem_size * (
+                        1
+                        + sum(
+                            (n - 1) * s for n, s in zip(ref.shape[1:], ref.stride()[1:])
+                        )
+                    )
+                    if any(n <= 0 for n in ref.shape[1:]) or span > page:
+                        raise ValueError("Compact layer view spans outside its page")
                 # Packed layouts (e.g. DSv4) interleave layers per block, so the
                 # attention tensor's stride(0) (the manager-block stride) exceeds
                 # page_size_bytes; other layouts have stride(0) == page_size_bytes.
@@ -230,6 +241,46 @@ class OffloadingConnectorWorker:
                 (block_stride, 1),
                 storage_offset=0,
             )
+            if perf.compact_groups:
+                if not self._known_packed_layout:
+                    raise ValueError("compact_groups requires certified packed storage")
+                host_bytes = self.spec.config.compact_page_size_bytes
+                assert host_bytes is not None
+                group_pages = self.spec.config.compact_group_page_sizes
+                if group_pages is None:
+                    raise ValueError("Compact group page sizes were not resolved")
+                regions = packed_group_regions(
+                    [
+                        [
+                            (view.storage_offset(), view.shape[1])
+                            for name in group.layer_names
+                            for view in tensors_per_block[name]
+                        ]
+                        for group in selected_groups
+                    ],
+                    block_stride,
+                    group_pages,
+                )
+                self._init_worker(
+                    CanonicalKVCaches(
+                        [CanonicalKVCacheTensor(packed_tensor, block_stride)],
+                        [
+                            [
+                                CanonicalKVCacheRef(
+                                    0,
+                                    size,
+                                    gpu_offset_bytes=gpu_offset,
+                                    host_offset_bytes=host_offset,
+                                )
+                                for gpu_offset, host_offset, size in group
+                            ]
+                            for group in regions
+                        ],
+                        compact_page_size_bytes=host_bytes,
+                        compact_group_page_sizes=group_pages,
+                    )
+                )
+                return
             self._init_worker(
                 CanonicalKVCaches(
                     [CanonicalKVCacheTensor(packed_tensor, block_stride)],
@@ -238,6 +289,8 @@ class OffloadingConnectorWorker:
             )
             return
 
+        if perf.compact_groups:
+            raise ValueError("compact_groups requires a packed KV cache layout")
         block_tensors: list[CanonicalKVCacheTensor] = []
         block_data_refs: dict[str, list[CanonicalKVCacheRef]] = defaultdict(list)
         # Layers that alias the same bytes (cache groups overlay each other) share
@@ -308,6 +361,12 @@ class OffloadingConnectorWorker:
                     "Promised store was rejected during capacity fallback"
                 ) from error
             self._retained_submission_intents.pop()
+
+    def record_load_destination_ready(self, metadata: OffloadingConnectorMetadata):
+        if self.worker is not None and metadata.load_jobs:
+            record = getattr(self.worker, "record_load_destination_ready", None)
+            if record is not None:
+                record()
 
     def handle_preemptions(self, kv_connector_metadata: OffloadingConnectorMetadata):
         assert self.worker is not None

@@ -29,3 +29,10 @@ class CPULoadStoreSpec(BlockIDsLoadStoreSpec):
     @property
     def chunk_ids(self) -> np.ndarray:
         return self.block_ids
+
+    @classmethod
+    def from_page_offsets(cls, offsets):
+        """Compact banks use 64-bit page coordinates, including banks over 8 TiB."""
+        result = cls([])
+        result.block_ids = np.array(offsets, dtype=np.int64)
+        return result
