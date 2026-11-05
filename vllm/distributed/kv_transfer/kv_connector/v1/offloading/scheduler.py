@@ -26,6 +26,7 @@ from vllm.distributed.kv_transfer.kv_connector.v1.offloading.metrics import (
     OffloadingConnectorStats,
     _ConnectorMetricName,
     _TransferMetricName,
+    record_executor_statistics,
 )
 from vllm.logger import init_logger
 from vllm.utils.math_utils import cdiv, round_down
@@ -57,6 +58,7 @@ from vllm.v1.kv_offload.base import (
     TierMatcher,
     make_offload_key,
 )
+from vllm.v1.kv_offload.cpu.perf import CPUPerfConfig
 from vllm.v1.metrics.cache_hit_source import CacheHitSource
 from vllm.v1.outputs import KVConnectorOutput
 from vllm.v1.request import Request, RequestStatus
@@ -382,6 +384,7 @@ class RequestOffloadState:
     load_key_ranges: list[tuple[int, int, OffloadKey]] = field(default_factory=list)
     # True once on_request_finished has been signaled to the manager.
     finished_signaled: bool = False
+    next_store_tokens: int = 0
 
     def __post_init__(self) -> None:
         self.group_states = tuple(
@@ -573,6 +576,24 @@ class OffloadingConnectorScheduler:
             spec, vllm_config, kv_cache_config
         )
         self.manager: OffloadingManager = spec.get_manager()
+        self._incremental_store = CPUPerfConfig.from_extra_config(
+            spec.config.extra_config
+        ).incremental_store
+        self._store_frontier_eligible = (
+            self._incremental_store
+            and bool(self.config.kv_group_configs)
+            and self.config.retention_interval is None
+            and vllm_config.speculative_config is None
+            and all(
+                not group.is_eagle_group and not group.requires_cow_source
+                for group in self.config.kv_group_configs
+            )
+        )
+        logger.info(
+            "Native CPU incremental_store requested=%s effective=%s",
+            self._incremental_store,
+            self._store_frontier_eligible,
+        )
         self._connector_stats = OffloadingConnectorStats()
 
         full_attention_groups: list[int] = []
@@ -1290,22 +1311,30 @@ class OffloadingConnectorScheduler:
             req_status.update_offload_keys()
 
             if preempted:
+                req_status.next_store_tokens = 0
                 for group_state in req_status.group_states:
                     group_state.block_ids.clear()
 
             if new_block_id_groups:
+                if any(new_block_id_groups):
+                    req_status.next_store_tokens = 0
                 if self._sliding_window_groups:
                     new_block_ids_end[req_id] = tuple(
                         len(req_status.group_states[grp_idx].block_ids)
                         for grp_idx in self._sliding_window_groups
                     )
                 req_status.update_block_id_groups(new_block_id_groups)
-                for group_config in self.config.kv_group_configs:
-                    new_blocks = new_block_id_groups[group_config.group_idx]
+                # Packed storage is shared across every manager group, including
+                # non-offloaded scratch groups. Their allocations can reuse an
+                # offload source and must participate in the pre-write fence.
+                for new_blocks in new_block_id_groups:
                     for bid in new_blocks:
                         if bid != 0:
                             self._current_batch_allocated_block_ids.add(bid)
 
+        self._current_batch_allocated_block_ids.update(
+            bid for bid in (scheduler_output.new_block_ids_to_zero or ()) if bid != 0
+        )
         for copy in scheduler_output.kv_cache_block_copies or ():
             self._current_batch_allocated_block_ids.add(copy.dst_block_id)
 
@@ -1593,9 +1622,33 @@ class OffloadingConnectorScheduler:
                 num_scheduled_tokens = scheduler_output.num_scheduled_tokens[req_id]
                 num_tokens_after_batch = req.num_computed_tokens + num_scheduled_tokens
 
+            if (
+                self._store_frontier_eligible
+                and not req.is_finished()
+                and num_tokens_after_batch < req_status.next_store_tokens
+            ):
+                continue
             num_offloadable_tokens = self._calc_num_offloadable_tokens(
                 req_status, num_tokens_after_batch
             )
+            if (
+                self._store_frontier_eligible
+                and not req.is_finished()
+                and all(
+                    num_offloadable_tokens // group.tokens_per_chunk
+                    <= state.next_stored_chunk_idx
+                    for group, state in zip(
+                        self.config.kv_group_configs, req_status.group_states
+                    )
+                )
+            ):
+                req_status.next_store_tokens = min(
+                    (state.next_stored_chunk_idx + 1) * group.tokens_per_chunk
+                    for group, state in zip(
+                        self.config.kv_group_configs, req_status.group_states
+                    )
+                )
+                continue
             prompt_offloadable_tokens = self._calc_num_offloadable_tokens(
                 req_status, req.num_prompt_tokens
             )
@@ -1949,6 +2002,9 @@ class OffloadingConnectorScheduler:
                     )
             self._connector_stats.aggregate(transfer_stats)
 
+        if meta.executor_stats:
+            record_executor_statistics(self._connector_stats, meta.executor_stats)
+
         for job_id, count in meta.completed_jobs.items():
             assert count > 0
             if job_id < self._stale_job_threshold:
@@ -2078,6 +2134,7 @@ class OffloadingConnectorScheduler:
 
         # Reset store progress so active requests re-offload from chunk 0.
         for status in self._req_status.values():
+            status.next_store_tokens = 0
             for group_state in status.group_states:
                 group_state.next_stored_chunk_idx = 0
             status.transfer_jobs.clear()

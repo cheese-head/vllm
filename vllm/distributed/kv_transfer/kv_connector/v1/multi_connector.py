@@ -392,6 +392,11 @@ class MultiConnector(KVConnectorBase_V1, SupportsHMA):
         for c, cm in zip(self._connectors, kv_connector_metadata.metadata):
             c.handle_preemptions(cm)
 
+    def record_load_destination_ready(self, metadata: KVConnectorMetadata) -> None:
+        assert isinstance(metadata, MultiKVConnectorMetadata)
+        for connector, child_meta in zip(self._connectors, metadata.metadata):
+            connector.record_load_destination_ready(child_meta)
+
     def get_finished_count(self) -> int | None:
         child_counts = [
             connector.get_finished_count() for connector in self._connectors

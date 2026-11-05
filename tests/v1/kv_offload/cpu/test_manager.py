@@ -1561,3 +1561,95 @@ def test_request_key_positions_order_tails_across_kv_groups():
     output = manager.prepare_store(to_keys([10, 11]), make_req_context("evict"))
     assert output is not None
     assert set(output.evicted_keys) == {group_0_tail, group_1_tail}
+
+
+@pytest.mark.parametrize("missing_positions", [False, True])
+@pytest.mark.parametrize("finish_before_complete", [False, True])
+def test_incremental_recency_matches_legacy_eviction_trace(
+    missing_positions, finish_before_complete
+):
+    import random
+
+    rng = random.Random(42)
+    observations = []
+    offers = [rng.sample(range(12), 12) for _ in range(12)]
+    for enabled in [False, True]:
+        manager = CPUOffloadingManager(num_chunks=12, incremental_recency=enabled)
+        trace = []
+        for step, offer in enumerate(offers):
+            context = make_req_context(str(step))
+            keys = [make_offload_key(str(k + step * 3).encode(), k % 3) for k in offer]
+            for i, key in enumerate(keys):
+                if not missing_positions or i != 0:
+                    context.set_offload_key_position(key, (i % 5) * 16)
+            output = manager.prepare_store(keys, context)
+            assert output is not None
+            trace.append((list(output.keys_to_store), list(output.evicted_keys)))
+            if finish_before_complete:
+                manager.on_request_finished(context)
+            manager.complete_store(output.keys_to_store, context)
+            manager.on_request_finished(context)
+            if step == 6:
+                manager.reset_cache()
+        observations.append(trace)
+    assert observations[0] == observations[1]
+
+
+def test_compact_group_capacity_and_transfer_pins():
+    manager = CPUOffloadingManager(num_chunks=16, compact_group_units={0: 8, 1: 1})
+    context = make_req_context("compact")
+    large = make_offload_key(b"large", 0)
+    small = [make_offload_key(str(i).encode(), 1) for i in range(8)]
+    first = manager.prepare_store([large], context)
+    second = manager.prepare_store(small, context)
+    assert first is not None and second is not None
+    assert len(manager.resident_keys()) == 9  # Fixed largest-group slots hold only two.
+    assert first.store_spec.block_ids.dtype == np.int64
+    assert manager._slot_allocator.free_units == 0
+    manager.complete_store([large, *small], context)
+    manager.prepare_load([large], context)
+    other = make_offload_key(b"other", 0)
+    result = manager.prepare_store([other], make_req_context("other"))
+    assert result is not None and set(result.evicted_keys) == set(small)
+    assert manager.lookup(large, context) == LookupResult.HIT
+    assert manager._compact_read_units == 8
+    assert manager._compact_write_units == 8
+    assert manager.prepare_store([make_offload_key(b"blocked", 0)], context) is None
+    manager.complete_load([large], context)
+    manager.complete_store([other], context, success=False)
+    assert manager._compact_read_units == manager._compact_write_units == 0
+    assert manager._slot_allocator.free_units == 8
+    manager.reset_cache()
+    assert manager._slot_allocator.free_units == 16
+    assert manager.lookup(large, context) == LookupResult.MISS
+
+
+def test_fragmented_compact_admission_reports_real_evictions_and_keeps_readers():
+    manager = CPUOffloadingManager(
+        num_chunks=8, compact_group_units={0: 2, 1: 1}, enable_events=True
+    )
+    context = make_req_context("fragmented")
+    keys = [make_offload_key(str(i).encode(), 1) for i in range(8)]
+    result = manager.prepare_store(keys, context)
+    assert result is not None
+    manager.complete_store(keys, context)
+    list(manager.take_events())
+    pinned = [
+        key for key, offset in zip(keys, result.store_spec.block_ids) if offset % 2 == 0
+    ]
+    manager.prepare_load(pinned, context)
+    assert manager.prepare_store([make_offload_key(b"large", 0)], context) is None
+    events = list(manager.take_events())
+    removed = {key for event in events if event.removed for key in event.keys}
+    assert removed == set(keys) - set(pinned)
+    assert manager.resident_keys() == set(pinned)
+    assert manager._slot_allocator.free_units == 4
+    assert manager._compact_read_units == 4 and manager._compact_write_units == 0
+    manager.complete_load(pinned, context)
+    assert manager.prepare_store([make_offload_key(b"large", 0)], context) is not None
+
+
+def test_compact_offsets_preserve_64_bit_bank_coordinates():
+    spec = CPULoadStoreSpec.from_page_offsets([2**32 + 7])
+    assert spec.block_ids.tolist() == [2**32 + 7]
+    assert spec.block_ids.dtype == np.int64

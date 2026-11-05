@@ -350,13 +350,14 @@ class TieringOffloadingSpec(CPUOffloadingSpec):
             try:
                 # Create scheduler-side SharedOffloadRegion (rank=None) so the
                 # primary tier can eagerly create a memoryview over _base.
-                scheduler_mmap = SharedOffloadRegion(
-                    engine_id=self._engine_id,
-                    num_chunks=self.num_chunks,
-                    rank=None,
-                    kv_bytes_per_chunk=self.kv_bytes_per_chunk,
-                    cpu_page_size=self.cpu_page_size_per_worker,
-                )
+                if not self.perf_config.compact_groups:
+                    scheduler_mmap = SharedOffloadRegion(
+                        engine_id=self._engine_id,
+                        num_chunks=self.num_chunks,
+                        rank=None,
+                        kv_bytes_per_chunk=self.kv_bytes_per_chunk,
+                        cpu_page_size=self.cpu_page_size_per_worker,
+                    )
                 self._scheduler_mmap = scheduler_mmap
 
                 # Create primary tier (CPU-based)
@@ -366,11 +367,18 @@ class TieringOffloadingSpec(CPUOffloadingSpec):
                     cache_policy_module_path=self.cache_policy_module_path,
                     enable_events=self.kv_events_config.enable_kv_cache_events,
                     mmap_region=scheduler_mmap,
+                    incremental_recency=self.perf_config.incremental_recency,
+                    compact_group_units=self.compact_group_units,
                 )
 
                 # Create secondary tiers
-                primary_kv_view = primary_tier.get_kv_memoryview()
+                primary_kv_view = (
+                    primary_tier.get_kv_memoryview()
+                    if self.secondary_tier_configs
+                    else None
+                )
                 for i, tier_config in enumerate(self.secondary_tier_configs):
+                    assert primary_kv_view is not None
                     tier = SecondaryTierFactory.create_secondary_tier(
                         tier_config, primary_kv_view, self
                     )
@@ -387,6 +395,11 @@ class TieringOffloadingSpec(CPUOffloadingSpec):
                 tiering_manager = TieringOffloadingManager(
                     primary_tier=primary_tier,
                     secondary_tiers=secondary_tiers,
+                    primary_chunk_size_bytes=(
+                        self.kv_bytes_per_chunk
+                        if self.perf_config.compact_groups
+                        else None
+                    ),
                 )
                 self._manager = tiering_manager
             except Exception:
@@ -436,6 +449,8 @@ class TieringOffloadingSpec(CPUOffloadingSpec):
 
     @override
     def create_worker(self, kv_caches: CanonicalKVCaches) -> CPUOffloadingWorker:
+        if self.perf_config.compact_groups:
+            return CPUOffloadingSpec.create_worker(self, kv_caches)
         world_size = self.config.parallel.world_size
         if self.replicated_layout:
             rank = 0
@@ -460,6 +475,7 @@ class TieringOffloadingSpec(CPUOffloadingSpec):
                 mmap_region=worker_mmap,
                 canonical_layout=self.config.canonical_layout,
                 copy_executor_config=self.copy_executor_config,
+                perf_config=self.perf_config,
             )
         except Exception:
             worker_mmap.cleanup()

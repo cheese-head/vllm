@@ -32,10 +32,15 @@ from vllm.v1.kv_offload.cpu.copy_executor import (
     CopyExecutorConfig,
     NativeCopyExecutor,
 )
+from vllm.v1.kv_offload.cpu.perf import CPUPerfConfig
 from vllm.v1.kv_offload.cpu.shared_offload_region import SharedOffloadRegion
 from vllm.v1.kv_offload.cpu.swap_blocks_triton import (
     THRESHOLD_BYTES,
     swap_blocks_batch,
+)
+from vllm.v1.kv_offload.cpu.transfer_lifecycle import (
+    CapturedStoreIntent,
+    capture_store_intent,
 )
 
 logger = init_logger(__name__)
@@ -89,6 +94,7 @@ def compute_sub_block_ptrs(
     output: np.ndarray,
     tensor: torch.Tensor,
     skip_count: int = 0,
+    page_size_bytes: int | None = None,
 ):
     """Compute byte pointers for sub-blocks of the given block IDs.
 
@@ -106,6 +112,7 @@ def compute_sub_block_ptrs(
         blocks_per_chunk: number of sub-blocks per block.
         output: pre-allocated pointer array to write pointers into.
         tensor: the source or destination tensor.
+        page_size_bytes: compact sub-block width when tensor rows are allocator pages.
         skip_count: sub-blocks to skip in the first block.
 
     """
@@ -121,8 +128,11 @@ def compute_sub_block_ptrs(
         return
 
     # Vectorized expansion for blocks_per_chunk > 1.
-    assert tensor.shape[1] % blocks_per_chunk == 0
-    block_page_size = tensor.shape[1] // blocks_per_chunk
+    if page_size_bytes is None:
+        assert tensor.shape[1] % blocks_per_chunk == 0
+        block_page_size = tensor.shape[1] // blocks_per_chunk
+    else:
+        block_page_size = page_size_bytes
     sub_offsets = np.arange(blocks_per_chunk, dtype=np.uint64) * block_page_size
     # (num_blocks, 1) + (1, blocks_per_chunk) -> (num_blocks, blocks_per_chunk)
     all_ptrs = (
@@ -305,6 +315,8 @@ class SingleDirectionOffloadingHandler:
         gpu_to_cpu: bool,
         canonical_layout: bool = False,
         host_memory_is_pinned: bool = True,
+        compact_page_size_bytes: int | None = None,
+        compact_group_page_sizes: tuple[int, ...] | None = None,
     ):
         """Initialize a SingleDirectionOffloadingHandler.
 
@@ -321,6 +333,9 @@ class SingleDirectionOffloadingHandler:
                 described by the refs' mappings.
             host_memory_is_pinned: whether the CPU tensors are pinned, so GPU
                 kernels may dereference them directly.
+            compact_page_size_bytes: allocator page width in compact banks;
+                None preserves the full GPU row width.
+            compact_group_page_sizes: bytes per group sub-block in compact banks.
 
         """
         assert len(gpu_tensors) == len(cpu_tensors)
@@ -346,8 +361,13 @@ class SingleDirectionOffloadingHandler:
                 assert (
                     cpu_page_size == canonical_bytes_per_block[t_idx] * blocks_per_chunk
                 )
+            elif compact_group_page_sizes is not None:
+                assert cpu_page_size == compact_page_size_bytes
             else:
-                assert cpu_page_size == gpu_page_size * blocks_per_chunk
+                assert (
+                    cpu_page_size
+                    == (compact_page_size_bytes or gpu_page_size) * blocks_per_chunk
+                )
 
         self.src_tensors: list[torch.Tensor] = (
             gpu_tensors if gpu_to_cpu else cpu_tensors
@@ -356,10 +376,13 @@ class SingleDirectionOffloadingHandler:
             cpu_tensors if gpu_to_cpu else gpu_tensors
         )
         self.gpu_to_cpu: bool = gpu_to_cpu
+        self._compact_group_page_sizes = compact_group_page_sizes
         self.layer_refs_per_group = layer_refs_per_group
         self._swap_blocks_batch = _select_swap_blocks_fn(
             layer_refs_per_group, gpu_to_cpu, host_memory_is_pinned
         )
+        if compact_page_size_bytes is not None:
+            self._swap_blocks_batch = ops.swap_blocks_batch
 
         # GPU blocks may be smaller
         # cpu_page_size = gpu_page_size * blocks_per_chunk.
@@ -440,6 +463,12 @@ class SingleDirectionOffloadingHandler:
                 all_src[op_idx:end_idx],
                 self.src_tensors[t_idx],
                 skip_count=src_skip_count,
+                page_size_bytes=(
+                    self._compact_group_page_sizes[g_idx]
+                    if self._compact_group_page_sizes is not None
+                    and not self.gpu_to_cpu
+                    else None
+                ),
             )
             compute_sub_block_ptrs(
                 group_dst,
@@ -447,9 +476,21 @@ class SingleDirectionOffloadingHandler:
                 all_dst[op_idx:end_idx],
                 self.dst_tensors[t_idx],
                 skip_count=dst_skip_count,
+                page_size_bytes=(
+                    self._compact_group_page_sizes[g_idx]
+                    if self._compact_group_page_sizes is not None and self.gpu_to_cpu
+                    else None
+                ),
             )
 
             all_sizes[op_idx:end_idx] = data_ref.page_size_bytes
+            if data_ref.gpu_offset_bytes or data_ref.host_offset_bytes:
+                if self.gpu_to_cpu:
+                    all_src[op_idx:end_idx] += data_ref.gpu_offset_bytes
+                    all_dst[op_idx:end_idx] += data_ref.host_offset_bytes
+                else:
+                    all_src[op_idx:end_idx] += data_ref.host_offset_bytes
+                    all_dst[op_idx:end_idx] += data_ref.gpu_offset_bytes
             num_bytes += group_size * data_ref.page_size_bytes
             op_idx = end_idx
         return op_idx, num_bytes
@@ -814,6 +855,7 @@ class CPUOffloadingWorker(OffloadingWorker):
         mmap_region: SharedOffloadRegion | None = None,
         canonical_layout: bool = False,
         copy_executor_config: CopyExecutorConfig | None = None,
+        perf_config: CPUPerfConfig | None = None,
     ):
         if copy_executor_config is not None and not current_platform.is_cuda():
             raise ValueError("cpu_copy_executor currently requires CUDA")
@@ -822,7 +864,14 @@ class CPUOffloadingWorker(OffloadingWorker):
         # successful construction, the worker is the sole owner and releases
         # it after both transfer directions have stopped.
         self._mmap_region = mmap_region
+        self._perf = perf_config or CPUPerfConfig()
+        self._load_destination_ready = None
         self._copy_executor = None
+        self._lifecycle_mode = (
+            copy_executor_config.lifecycle_mode if copy_executor_config else "legacy"
+        )
+        self._capture_seconds = 0.0
+        self._intent_submit_seconds = 0.0
         pin_memory = PIN_MEMORY
         logger.info("Allocating %d CPU tensors...", len(kv_caches.tensors))
         if mmap_region is not None and pin_memory:
@@ -845,6 +894,12 @@ class CPUOffloadingWorker(OffloadingWorker):
                 (-1, gpu_page_size_bytes)
             )
             cpu_page_size_bytes = gpu_page_size_bytes * blocks_per_chunk
+            if kv_caches.compact_page_size_bytes is not None:
+                if len(kv_caches.tensors) != 1 or canonical_layout:
+                    raise ValueError(
+                        "Compact CPU layout requires one direct packed tensor"
+                    )
+                cpu_page_size_bytes = kv_caches.compact_page_size_bytes
 
             if canonical_bytes_per_block is not None:
                 assert mmap_region is not None
@@ -880,6 +935,8 @@ class CPUOffloadingWorker(OffloadingWorker):
             gpu_to_cpu=True,
             canonical_layout=canonical_layout,
             host_memory_is_pinned=host_memory_is_pinned,
+            compact_page_size_bytes=kv_caches.compact_page_size_bytes,
+            compact_group_page_sizes=kv_caches.compact_group_page_sizes,
         )
 
         self._load_handler = SingleDirectionOffloadingHandler(
@@ -890,6 +947,8 @@ class CPUOffloadingWorker(OffloadingWorker):
             gpu_to_cpu=False,
             canonical_layout=canonical_layout,
             host_memory_is_pinned=host_memory_is_pinned,
+            compact_page_size_bytes=kv_caches.compact_page_size_bytes,
+            compact_group_page_sizes=kv_caches.compact_group_page_sizes,
         )
 
         if copy_executor_config is not None:
@@ -900,11 +959,13 @@ class CPUOffloadingWorker(OffloadingWorker):
                     self._store_handler,
                     self._load_handler,
                     _new_descriptor_buffers,
+                    precise_batching=self._perf.precise_batching,
                 ),
                 copy_executor_config,
             )
 
-    def _enqueue(self, job_id, direction, src_spec, dst_spec):
+    @staticmethod
+    def _snapshot_specs(src_spec, dst_spec):
         if not isinstance(src_spec, BlockIDsLoadStoreSpec) or not isinstance(
             dst_spec, BlockIDsLoadStoreSpec
         ):
@@ -917,18 +978,76 @@ class CPUOffloadingWorker(OffloadingWorker):
             if isinstance(spec, GPULoadStoreSpec):
                 spec.group_sizes = tuple(spec.group_sizes)
                 spec.block_indices = tuple(spec.block_indices)
-        producer = torch.Event()
-        producer.record(current_platform.current_stream())
         charge = source.block_ids.nbytes + target.block_ids.nbytes
-        gpu = source if direction == "store" else target
+        gpu = source if isinstance(source, GPULoadStoreSpec) else target
         if not isinstance(gpu, GPULoadStoreSpec):
             raise TypeError("Native CPU copies require GPU group coordinates")
         charge += 8 * (len(gpu.group_sizes) + len(gpu.block_indices))
+        return source, target, charge
+
+    @staticmethod
+    def capture_store_dependency():
+        producer = torch.Event()
+        producer.record(current_platform.current_stream())
+        return producer
+
+    def store_lifecycle_mode(self) -> str:
+        return getattr(self, "_lifecycle_mode", "legacy")
+
+    def store_lifecycle_limits(self) -> tuple[int, int]:
+        assert self._copy_executor is not None
+        config = self._copy_executor.config
+        return config.max_pending_jobs, config.max_pending_bytes
+
+    def capture_store(self, job_id, src_spec, dst_spec, producer):
+        if not isinstance(src_spec, GPULoadStoreSpec):
+            raise TypeError("Captured stores require a GPU source")
+        start = time.perf_counter()
+        intent = capture_store_intent(
+            job_id,
+            src_spec,
+            dst_spec,
+            snapshot_specs=self._snapshot_specs,
+            capture_producer=lambda: producer,
+        )
+        self._capture_seconds += time.perf_counter() - start
+        return intent
+
+    def submit_store_intent(self, intent: CapturedStoreIntent) -> bool:
+        assert self._copy_executor is not None
+        start = time.perf_counter()
+        self._copy_executor.submit(
+            intent.job_id,
+            "store",
+            ("store", intent.src_spec, intent.dst_spec),
+            intent.producer,
+            intent.metadata_bytes,
+        )
+        self._intent_submit_seconds += time.perf_counter() - start
+        return True
+
+    def _enqueue(self, job_id, direction, src_spec, dst_spec):
+        source, target, charge = self._snapshot_specs(src_spec, dst_spec)
+        gpu = source if direction == "store" else target
+        if not isinstance(gpu, GPULoadStoreSpec):
+            raise TypeError("Transfer direction does not match GPU coordinates")
+        if direction == "load" and self._perf.early_load_ready:
+            producer = self._load_destination_ready
+            if producer is None:
+                raise RuntimeError(
+                    "early_load_ready requires V2 destination preparation"
+                )
+        else:
+            producer = self.capture_store_dependency()
         assert self._copy_executor is not None
         self._copy_executor.submit(
             job_id, direction, (direction, source, target), producer, charge
         )
         return True
+
+    def record_load_destination_ready(self):
+        if self._perf.early_load_ready:
+            self._load_destination_ready = self.capture_store_dependency()
 
     def submit_store(
         self, job_id: int, src_spec: GPULoadStoreSpec, dst_spec: LoadStoreSpec
@@ -970,7 +1089,13 @@ class CPUOffloadingWorker(OffloadingWorker):
 
     def get_executor_statistics(self):
         executor = self._copy_executor
-        return executor.statistics() if executor is not None else {}
+        if executor is None:
+            return {}
+        return dict(
+            executor.statistics(),
+            capture_seconds=getattr(self, "_capture_seconds", 0.0),
+            intent_submit_seconds=getattr(self, "_intent_submit_seconds", 0.0),
+        )
 
     def shutdown(self) -> None:
         executor = getattr(self, "_copy_executor", None)

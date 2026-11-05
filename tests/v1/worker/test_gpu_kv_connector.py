@@ -1,7 +1,10 @@
 # SPDX-License-Identifier: Apache-2.0
 # SPDX-FileCopyrightText: Copyright contributors to the vLLM project
 
+import ast
+from pathlib import Path
 from types import SimpleNamespace
+from typing import Any
 from unittest.mock import Mock
 
 import pytest
@@ -19,6 +22,7 @@ def _make_connector(
 ) -> ActiveKVConnector:
     backend = Mock()
     backend.handle_preemptions.side_effect = lambda _: events.append("handle")
+    backend.record_load_destination_ready.side_effect = lambda _: events.append("ready")
     backend.bind_connector_metadata.side_effect = lambda _: events.append("bind")
     backend.start_load_kv.side_effect = lambda *_args, **_kwargs: events.append("start")
     backend.wait_for_save.side_effect = lambda: events.append("wait")
@@ -64,6 +68,9 @@ def test_load_start_phase(
     request_indices = torch.tensor([3, 1])
     request_ids = ["first", "second"]
     attn_metadata = {"layer": object()}
+    connector.before_cache_update(output)
+    events.append("cache-writers")
+    connector.after_cache_update(output)
     connector.pre_forward(
         output,
         request_state_indices=request_indices,
@@ -71,11 +78,21 @@ def test_load_start_phase(
         attn_metadata=attn_metadata,
     )
     assert events == (
-        ["handle", "bind", "start"] if has_sync_kv_loads else ["handle", "bind"]
+        ["handle", "cache-writers", "ready", "bind", "start"]
+        if has_sync_kv_loads
+        else ["handle", "cache-writers", "ready", "bind"]
     )
 
     connector.post_forward(set())
-    assert events == ["handle", "bind", "start", "wait", "clear"]
+    assert events == [
+        "handle",
+        "cache-writers",
+        "ready",
+        "bind",
+        "start",
+        "wait",
+        "clear",
+    ]
 
     kwargs = connector.kv_connector.start_load_kv.call_args.kwargs
     assert kwargs["request_state_indices"] is request_indices
@@ -92,6 +109,58 @@ def test_no_forward_starts_deferred_load_once(monkeypatch: pytest.MonkeyPatch):
     events: list[str] = []
     connector = _make_connector(monkeypatch, events)
 
-    connector.no_forward(_scheduler_output(False))
+    output = _scheduler_output(False)
+    connector.before_cache_update(output)
+    connector.after_cache_update(output)
+    connector.no_forward(output)
 
-    assert events == ["handle", "bind", "start", "wait", "clear"]
+    assert events == ["handle", "ready", "bind", "start", "wait", "clear"]
+
+
+@pytest.mark.parametrize("writer", ["zero", "cow"])
+@pytest.mark.parametrize("has_sync_kv_loads", [False, True])
+def test_actual_v2_execute_protects_cache_before_writers(
+    monkeypatch, writer, has_sync_kv_loads
+):
+    """Exercise the real runner call order without allocating a GPU runner."""
+    events: list[str] = []
+    connector = _make_connector(monkeypatch, events)
+    output = _scheduler_output(has_sync_kv_loads)
+    output.total_num_scheduled_tokens = 0
+    source = Path(__file__).resolve().parents[3] / "vllm/v1/worker/gpu/model_runner.py"
+    tree = ast.parse(source.read_text())
+    cls = next(
+        n
+        for n in tree.body
+        if isinstance(n, ast.ClassDef) and n.name == "GPUModelRunner"
+    )
+    execute = next(
+        n
+        for n in cls.body
+        if isinstance(n, ast.FunctionDef) and n.name == "execute_model"
+    )
+    execute.decorator_list = []
+    namespace: dict[str, Any] = {}
+    module = ast.Module(
+        body=[
+            ast.ImportFrom(
+                module="__future__", names=[ast.alias(name="annotations")], level=0
+            ),
+            execute,
+        ],
+        type_ignores=[],
+    )
+    exec(compile(ast.fix_missing_locations(module), str(source), "exec"), namespace)
+    runner = SimpleNamespace(
+        kv_connector=connector,
+        update_pp_decode_requests=lambda: None,
+        finish_requests=lambda _: None,
+        free_states=lambda _: None,
+        add_requests=lambda _: None,
+        update_requests=lambda _: events.append(writer),
+        block_tables=SimpleNamespace(apply_staged_writes=lambda: None),
+        aux_output_connector=None,
+        _merge_ec_connector_no_forward=lambda _, result: result,
+    )
+    namespace["execute_model"](runner, output)
+    assert events == ["handle", writer, "ready", "bind", "start", "wait", "clear"]

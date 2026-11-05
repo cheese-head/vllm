@@ -88,3 +88,7 @@ class OffloadingConfig:
     canonical_layout: bool = False
     # Resolved KVCacheLayout name of the worker KV cache.
     kv_cache_layout: str | None = None
+    # Allocator granule in each worker's private compact CPU bank.
+    compact_page_size_bytes: int | None = None
+    # Per-group bytes for one GPU block; allocations include blocks_per_chunk.
+    compact_group_page_sizes: tuple[int, ...] | None = None

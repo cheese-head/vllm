@@ -1,5 +1,7 @@
 # SPDX-License-Identifier: Apache-2.0
 # SPDX-FileCopyrightText: Copyright contributors to the vLLM project
+import os
+import time
 from collections import defaultdict
 from dataclasses import replace
 
@@ -20,8 +22,11 @@ from vllm.distributed.kv_transfer.kv_connector.v1.offloading.config import (
 from vllm.logger import init_logger
 from vllm.v1.kv_cache_interface import (
     AttentionSpec,
+    FullAttentionSpec,
     KVCacheConfig,
     MambaSpec,
+    MLAAttentionSpec,
+    SlidingWindowMLASpec,
     UniformTypeKVCacheSpecs,
     group_kernel_blocks,
 )
@@ -33,6 +38,11 @@ from vllm.v1.kv_offload.base import (
     LoadStoreSpec,
     OffloadingSpec,
     OffloadingWorker,
+)
+from vllm.v1.kv_offload.cpu.perf import CPUPerfConfig, packed_group_regions
+from vllm.v1.kv_offload.cpu.transfer_lifecycle import (
+    CapturedStoreIntent,
+    DeferredStoreQueue,
 )
 
 logger = init_logger(__name__)
@@ -51,6 +61,13 @@ class OffloadingConnectorWorker:
         self.vllm_config = vllm_config
         self.kv_cache_config = kv_cache_config
         self.worker: OffloadingWorker | None = None
+        self._captured_stores: DeferredStoreQueue | None = None
+        self._selective_stores = False
+        self._known_packed_layout = False
+        self._retained_submission_intents: list[CapturedStoreIntent] = []
+        self._next_executor_report = 0.0
+        self._last_executor_counters: dict[str, float] = {}
+        self._store_capacity_fallbacks = 0
         # Non-writers still ack: pending_count waits for world_size per job.
         self._is_store_writer = (
             not self.spec.replicated_layout
@@ -67,9 +84,58 @@ class OffloadingConnectorWorker:
 
     def _init_worker(self, kv_caches: CanonicalKVCaches) -> None:
         self.worker = self.spec.get_worker(kv_caches)
+        mode = getattr(self.worker, "store_lifecycle_mode", lambda: "legacy")()
+        require_selective = (
+            os.environ.get("VLLM_NATIVE_CPU_LIFECYCLE_REQUIRE_SELECTIVE") == "1"
+        )
+        if require_selective and mode != "selective":
+            raise RuntimeError("Requested selective store executor was not enabled")
+        if mode not in ("capture_only", "selective"):
+            return
+        limits = self.worker.store_lifecycle_limits()
+        self._captured_stores = DeferredStoreQueue(*limits)
+        selected = get_offloading_group_ids(self.kv_cache_config)
+        specs = [
+            self.kv_cache_config.kv_cache_groups[i].kv_cache_spec for i in selected
+        ]
+        actual = [
+            item
+            for spec in specs
+            for item in (
+                spec.kv_cache_specs.values()
+                if isinstance(spec, UniformTypeKVCacheSpecs)
+                else (spec,)
+            )
+        ]
+        parallel = self.spec.config.parallel
+        eligible = (
+            self._known_packed_layout
+            and not self.spec.config.canonical_layout
+            and self.spec.blocks_per_chunk == 1
+            and self.vllm_config.speculative_config is None
+            and parallel.pp_size == parallel.pcp_size == parallel.dcp_size == 1
+            and parallel.data_parallel_size == 1
+            and bool(actual)
+            and all(
+                type(spec)
+                in (FullAttentionSpec, MLAAttentionSpec, SlidingWindowMLASpec)
+                for spec in actual
+            )
+        )
+        self._selective_stores = mode == "selective" and eligible
+        if mode == "selective" and not eligible and require_selective:
+            raise RuntimeError("Requested selective store layout was not certified")
+        logger.info(
+            "Native CPU lifecycle mode=%s effective=%s packed=%s rank=%d",
+            mode,
+            "selective" if self._selective_stores else "capture_only",
+            self._known_packed_layout,
+            parallel.rank,
+        )
 
     def register_kv_caches(self, kv_caches: dict[str, torch.Tensor]):
         kv_cache_config = self.kv_cache_config
+        perf = CPUPerfConfig.from_extra_config(self.spec.config.extra_config)
         selected_group_ids = get_offloading_group_ids(kv_cache_config)
         selected_groups = tuple(
             kv_cache_config.kv_cache_groups[group_id] for group_id in selected_group_ids
@@ -101,6 +167,15 @@ class OffloadingConnectorWorker:
                 page = layer_kv_cache_spec.page_size_bytes
                 elem_size = ref.element_size()
                 byte_offset = ref.storage_offset() * elem_size
+                if perf.compact_groups:
+                    span = elem_size * (
+                        1
+                        + sum(
+                            (n - 1) * s for n, s in zip(ref.shape[1:], ref.stride()[1:])
+                        )
+                    )
+                    if any(n <= 0 for n in ref.shape[1:]) or span > page:
+                        raise ValueError("Compact layer view spans outside its page")
                 # Packed layouts (e.g. DSv4) interleave layers per block, so the
                 # attention tensor's stride(0) (the manager-block stride) exceeds
                 # page_size_bytes; other layouts have stride(0) == page_size_bytes.
@@ -148,11 +223,64 @@ class OffloadingConnectorWorker:
             (tensor,) = tensors_per_block[packed_layer_name]
             num_blocks = tensor.shape[0]
             block_stride = tensor.stride(0)
+            storage = tensor.untyped_storage()
+            self._known_packed_layout = (
+                all(
+                    view.untyped_storage().data_ptr() == storage.data_ptr()
+                    and view.shape[0] == num_blocks
+                    and view.stride(0) == block_stride
+                    and view.storage_offset() >= 0
+                    and view.storage_offset() + view.shape[1] <= block_stride
+                    for views in tensors_per_block.values()
+                    for view in views
+                )
+                and storage.nbytes() >= num_blocks * block_stride
+            )
             packed_tensor = tensor.as_strided(
                 (num_blocks, block_stride),
                 (block_stride, 1),
                 storage_offset=0,
             )
+            if perf.compact_groups:
+                if not self._known_packed_layout:
+                    raise ValueError("compact_groups requires certified packed storage")
+                host_bytes = self.spec.config.compact_page_size_bytes
+                assert host_bytes is not None
+                group_pages = self.spec.config.compact_group_page_sizes
+                if group_pages is None:
+                    raise ValueError("Compact group page sizes were not resolved")
+                regions = packed_group_regions(
+                    [
+                        [
+                            (view.storage_offset(), view.shape[1])
+                            for name in group.layer_names
+                            for view in tensors_per_block[name]
+                        ]
+                        for group in selected_groups
+                    ],
+                    block_stride,
+                    group_pages,
+                )
+                self._init_worker(
+                    CanonicalKVCaches(
+                        [CanonicalKVCacheTensor(packed_tensor, block_stride)],
+                        [
+                            [
+                                CanonicalKVCacheRef(
+                                    0,
+                                    size,
+                                    gpu_offset_bytes=gpu_offset,
+                                    host_offset_bytes=host_offset,
+                                )
+                                for gpu_offset, host_offset, size in group
+                            ]
+                            for group in regions
+                        ],
+                        compact_page_size_bytes=host_bytes,
+                        compact_group_page_sizes=group_pages,
+                    )
+                )
+                return
             self._init_worker(
                 CanonicalKVCaches(
                     [CanonicalKVCacheTensor(packed_tensor, block_stride)],
@@ -161,6 +289,8 @@ class OffloadingConnectorWorker:
             )
             return
 
+        if perf.compact_groups:
+            raise ValueError("compact_groups requires a packed KV cache layout")
         block_tensors: list[CanonicalKVCacheTensor] = []
         block_data_refs: dict[str, list[CanonicalKVCacheRef]] = defaultdict(list)
         # Layers that alias the same bytes (cache groups overlay each other) share
@@ -216,8 +346,56 @@ class OffloadingConnectorWorker:
 
         self._init_worker(canonical_kv_caches)
 
+    def _queue_store(self, job_id, src_spec, dst_spec, producer) -> None:
+        assert self.worker is not None and self._captured_stores is not None
+        intent = self.worker.capture_store(job_id, src_spec, dst_spec, producer)
+        try:
+            self._captured_stores.append(intent)
+        except BufferError as error:
+            # The CPU manager already promised this store: preserve ownership
+            # and use the conservative blocking path, never silently reject it.
+            self._store_capacity_fallbacks += 1
+            self._retained_submission_intents.append(intent)
+            if not self.worker.submit_store_intent(intent):
+                raise RuntimeError(
+                    "Promised store was rejected during capacity fallback"
+                ) from error
+            self._retained_submission_intents.pop()
+
+    def record_load_destination_ready(self, metadata: OffloadingConnectorMetadata):
+        if self.worker is not None and metadata.load_jobs:
+            record = getattr(self.worker, "record_load_destination_ready", None)
+            if record is not None:
+                record()
+
     def handle_preemptions(self, kv_connector_metadata: OffloadingConnectorMetadata):
         assert self.worker is not None
+        if self._captured_stores is not None:
+            # Record the original next-step issue boundary before new GPU work.
+            self._captured_stores.bind_submission_gate(
+                self.worker.capture_store_dependency
+            )
+            flush = kv_connector_metadata.jobs_to_flush or set()
+            producer = None
+            for job_id in flush:
+                entry = kv_connector_metadata.store_jobs.pop(job_id, None)
+                if entry is None:
+                    continue
+                if not self._is_store_writer:
+                    self._connector_worker_meta.mark_completed(job_id)
+                    continue
+                if producer is None:
+                    producer = self.worker.capture_store_dependency()
+                self._queue_store(job_id, entry.src_spec, entry.dst_spec, producer)
+            self._captured_stores.submit_selected(
+                self.worker.submit_store_intent,
+                flush if self._selective_stores else None,
+            )
+            if flush:
+                if flush.intersection(self._captured_stores.pending_job_ids):
+                    raise RuntimeError("A required store was not accepted before reuse")
+                self.worker.wait(flush)
+            return
 
         # Pop jobs_to_flush from store_jobs into _unsubmitted_store_jobs
         # so the existing submission loop below submits them before wait().
@@ -245,6 +423,8 @@ class OffloadingConnectorWorker:
 
     def start_kv_transfers(self, metadata: OffloadingConnectorMetadata):
         assert self.worker is not None
+        if self._captured_stores is not None:
+            self._captured_stores.submit_selected(self.worker.submit_store_intent)
         for job_id, src_spec, dst_spec in self._unsubmitted_store_jobs:
             success = self.worker.submit_store(job_id, src_spec, dst_spec)
             assert success
@@ -257,10 +437,17 @@ class OffloadingConnectorWorker:
             assert success
 
     def prepare_store_kv(self, metadata: OffloadingConnectorMetadata):
+        assert self.worker is not None
+        producer = None
         for job_id, entry in metadata.store_jobs.items():
             if not self._is_store_writer:
                 # Gate before queueing: no _unsubmitted_store_jobs entry.
                 self._connector_worker_meta.mark_completed(job_id)
+                continue
+            if self._captured_stores is not None:
+                if producer is None:
+                    producer = self.worker.capture_store_dependency()
+                self._queue_store(job_id, entry.src_spec, entry.dst_spec, producer)
                 continue
             # NOTE(orozery): defer the store to the beginning of the next
             # engine step, so that offloading starts AFTER transfers related
@@ -309,11 +496,49 @@ class OffloadingConnectorWorker:
             if req_id is not None:
                 finished_recving.add(req_id)
 
+        now = time.monotonic()
+        if now >= self._next_executor_report:
+            self._next_executor_report = now + 10.0
+            snapshot = self.worker.get_executor_statistics()
+            if isinstance(snapshot, dict) and snapshot:
+                gauges = {
+                    "pending_jobs",
+                    "pending_metadata_bytes",
+                    "completed_unpolled",
+                    "pending_jobs_high_water",
+                    "pending_bytes_high_water",
+                }
+                snapshot = dict(
+                    snapshot,
+                    capacity_fallbacks=self._store_capacity_fallbacks,
+                    selective_enabled=float(self._selective_stores),
+                )
+                gauges.add("selective_enabled")
+                values = {
+                    key: float(value)
+                    if key in gauges
+                    else max(
+                        0.0, float(value) - self._last_executor_counters.get(key, 0.0)
+                    )
+                    for key, value in snapshot.items()
+                }
+                self._last_executor_counters = {
+                    key: float(value)
+                    for key, value in snapshot.items()
+                    if key not in gauges
+                }
+                self._connector_worker_meta.executor_stats[
+                    self.spec.config.parallel.rank
+                ] = values
+
         return set(), finished_recving
 
     def build_connector_worker_meta(self) -> OffloadingWorkerMetadata | None:
         """Return completed transfer job IDs since the last call."""
-        if not self._connector_worker_meta.completed_jobs:
+        if (
+            not self._connector_worker_meta.completed_jobs
+            and not self._connector_worker_meta.executor_stats
+        ):
             return None
         meta = self._connector_worker_meta
         self._connector_worker_meta = OffloadingWorkerMetadata()

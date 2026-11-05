@@ -4,6 +4,7 @@
 
 from __future__ import annotations
 
+import os
 import threading
 import time
 from collections import deque
@@ -18,6 +19,7 @@ _RETAINED_EXECUTORS: list[Any] = []
 
 @dataclass(frozen=True)
 class CopyExecutorConfig:
+    lifecycle_mode: str = "legacy"
     max_pending_jobs: int = 256
     max_pending_bytes: int = 64 * 1024**2
     max_inflight_batches: int = 8
@@ -41,10 +43,15 @@ class CopyExecutorConfig:
         unknown = options.keys() - {f.name for f in fields(cls)}
         if unknown:
             raise ValueError(f"Unknown cpu_copy_executor options: {sorted(unknown)}")
+        options.setdefault(
+            "lifecycle_mode", os.environ.get("VLLM_NATIVE_CPU_LIFECYCLE_MODE", "legacy")
+        )
         config = cls(**options)
         return config if enabled else None
 
     def __post_init__(self) -> None:
+        if self.lifecycle_mode not in ("legacy", "capture_only", "selective"):
+            raise ValueError("Unknown native CPU lifecycle_mode")
         for name in (
             "max_pending_jobs",
             "max_pending_bytes",
@@ -157,6 +164,7 @@ class NativeCopyExecutor:
             observed_batch_seconds=0.0,
             admission_wait_seconds=0.0,
             fence_wait_seconds=0.0,
+            fence_calls=0,
             pending_jobs_high_water=0,
             pending_bytes_high_water=0,
         )
@@ -230,6 +238,7 @@ class NativeCopyExecutor:
         start = time.monotonic()
         deadline = start + self.config.fence_timeout
         with self._cv:
+            self._stats["fence_calls"] += 1
             self._urgent.update(job_ids)
             self._cv.notify_all()
             try:

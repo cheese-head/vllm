@@ -27,6 +27,7 @@ from vllm.v1.kv_offload.config import (
     OffloadingModelConfig,
     OffloadingParallelConfig,
 )
+from vllm.v1.kv_offload.cpu.perf import CPUPerfConfig
 
 if TYPE_CHECKING:
     from vllm.config import VllmConfig
@@ -46,9 +47,8 @@ def get_offloading_group_ids(kv_cache_config: "KVCacheConfig") -> tuple[int, ...
 def _group_kv_bytes_per_block(group: "KVCacheGroupSpec") -> int:
     """Return the physical bytes occupied by one block of a cache group.
 
-    Worker configs may retain ``UniformTypeKVCacheSpecs`` while scheduler
-    configs flatten that wrapper to one representative per-layer spec.  Keep
-    the result invariant across those two representations.
+    Worker layouts retain every layer's page size. Scheduler representatives
+    may be lossy; compact reservations use preserved group metadata instead.
     """
     spec = group.kv_cache_spec
     if isinstance(spec, UniformTypeKVCacheSpecs):
@@ -171,6 +171,34 @@ def build_offloading_config(
     )
 
     canonical_layout = bool(extra_config.get("canonical_layout", False))
+    perf = CPUPerfConfig.from_extra_config(extra_config)
+    if perf.early_load_ready and not vllm_config.use_v2_model_runner:
+        raise ValueError("early_load_ready requires the V2 model runner")
+    compact_page_size_bytes = None
+    compact_group_page_sizes = None
+    if perf.compact_groups:
+        if extra_config.get("cpu_numa_nodes") is not None:
+            raise ValueError("compact_groups does not support explicit cpu_numa_nodes")
+        if canonical_layout or extra_config.get("secondary_tiers"):
+            raise ValueError("compact_groups requires direct CPU-only offloading")
+        if kv_cache_config.hisparse_host_num_blocks is not None:
+            raise ValueError("compact_groups does not support HiSparse host caches")
+        compact_page_size_bytes = 4096
+        group_sizes = kv_cache_config.group_page_size_bytes
+        if group_sizes is not None and (
+            len(group_sizes) != len(kv_cache_config.kv_cache_groups)
+            or any(type(size) is not int or size < 0 for size in group_sizes)
+        ):
+            raise ValueError("Invalid preserved KV cache group page sizes")
+        compact_group_page_sizes = tuple(
+            group_sizes[group_id]
+            if group_sizes is not None
+            else _group_kv_bytes_per_block(group)
+            for group_id, group in selected_groups
+        )
+        if not any(compact_group_page_sizes):
+            raise ValueError("compact_groups requires nonempty offload groups")
+        replicated_layout = False
 
     # Only a single non-MLA full-attention group with genuinely head-sharded
     # pages is parallelism-invariant: replicated latent or GQA heads,
@@ -281,4 +309,6 @@ def build_offloading_config(
         replicated_layout=replicated_layout,
         canonical_layout=canonical_layout,
         kv_cache_layout=vllm_config.cache_config.kv_cache_layout,
+        compact_page_size_bytes=compact_page_size_bytes,
+        compact_group_page_sizes=compact_group_page_sizes,
     )

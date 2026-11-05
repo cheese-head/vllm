@@ -1500,6 +1500,14 @@ class KVCacheConfig:
     kv_tp_replicas: int = 1
     """Consecutive TP ranks holding identical KV for every layer (1: none)."""
 
+    group_page_size_bytes: tuple[int, ...] | None = None
+    """Maximum per-worker group payload sizes before scheduler spec flattening.
+
+    Scheduler representatives retain attention semantics but can lose different
+    per-layer page sizes. Offload reservations use these maxima across workers;
+    transfer descriptors continue to use each worker's local layout.
+    """
+
     @cached_property
     def transfer_group_ids(self) -> tuple[int, ...]:
         """IDs of cache groups that participate in external KV transfer."""

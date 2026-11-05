@@ -730,3 +730,31 @@ def test_load_waits_for_pending_compute_stream_writes(
                 torch.testing.assert_close(gpu_tensor[block_id].cpu(), expected)
     finally:
         worker.shutdown()
+
+
+def test_captured_store_preserves_owned_ids_and_original_producer():
+    """Deferral must neither borrow mutable IDs nor capture a newer forward."""
+    from types import SimpleNamespace
+
+    from vllm.v1.kv_offload.cpu.common import CPULoadStoreSpec
+
+    worker = CPUOffloadingWorker.__new__(CPUOffloadingWorker)
+    worker._capture_seconds = worker._intent_submit_seconds = 0.0
+    submissions = []
+    worker._copy_executor = SimpleNamespace(
+        submit=lambda *args: submissions.append(args)
+    )
+    producer = object()
+    source = GPULoadStoreSpec([2, 4], group_sizes=(2,), block_indices=(0,))
+    target = CPULoadStoreSpec([1, 3])
+    intent = worker.capture_store(23, source, target, producer)
+    source.block_ids[0] = 9
+    target.block_ids[0] = 8
+    assert worker.submit_store_intent(intent)
+    submitted = submissions[0]
+    assert submitted[0] == 23 and submitted[1] == "store"
+    assert submitted[3] is producer
+    assert submitted[2][1].block_ids.tolist() == [2, 4]
+    assert submitted[2][2].block_ids.tolist() == [1, 3]
+    assert not intent.src_spec.block_ids.flags.writeable
+    assert not intent.dst_spec.block_ids.flags.writeable

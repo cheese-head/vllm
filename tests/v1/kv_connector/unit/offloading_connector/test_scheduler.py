@@ -54,6 +54,7 @@ from vllm.v1.core.single_type_kv_cache_manager import (
 )
 from vllm.v1.kv_cache_interface import (
     ChunkedLocalAttentionSpec,
+    CircularBufferSpec,
     FullAttentionSpec,
     KVCacheConfig,
     KVCacheGroupSpec,
@@ -200,6 +201,8 @@ def test_swa_offload_window_covers_unaligned_hit(
 
 def _make_partial_tail_scheduler(
     recurrent_only: bool = False,
+    *,
+    scratch_groups: bool = False,
 ) -> OffloadingConnectorScheduler:
     vllm_config = _make_vllm_config(extra_config={"self_describing_kv_events": True})
     vllm_config.cache_config.prefix_match_unit = None if recurrent_only else 4
@@ -210,6 +213,16 @@ def _make_partial_tail_scheduler(
     kv_cache_config = _make_mamba_hybrid_kv_cache_config()
     if recurrent_only:
         kv_cache_config.kv_cache_groups = kv_cache_config.kv_cache_groups[1:]
+    if scratch_groups:
+        # These pools share manager-block IDs but never produce offload keys.
+        scratch_spec = CircularBufferSpec(
+            block_size=16, num_kv_heads=1, head_size=8, dtype=torch.float16
+        )
+        kv_cache_config.kv_cache_groups = [
+            KVCacheGroupSpec(["scratch-before"], scratch_spec),
+            *kv_cache_config.kv_cache_groups,
+            KVCacheGroupSpec(["scratch-after"], scratch_spec),
+        ]
     spec = MockOffloadingSpec(build_offloading_config(vllm_config, kv_cache_config))
     return OffloadingConnectorScheduler(spec, vllm_config, kv_cache_config)
 
@@ -395,6 +408,55 @@ def test_aligned_boundary_store_flushes_before_block_reuse(cow_reuse):
     meta = scheduler.build_connector_meta(output)
 
     assert meta.jobs_to_flush == {job_id}
+
+
+@pytest.mark.parametrize("mutation", ["scratch_allocation", "zeroing", "cow"])
+def test_pending_store_is_fenced_by_every_physical_block_writer(mutation):
+    """A source remains protected when another pool or pre-forward write uses it.
+
+    The source store is created through the real boundary-store path. Scratch
+    pools are deliberately excluded from offload configuration, so tracking only
+    selected groups would miss their reuse of the source's manager-block ID.
+    """
+    scheduler = _make_partial_tail_scheduler(scratch_groups=True)
+    _make_partial_tail_request(scheduler)
+    assert [group.group_idx for group in scheduler.config.kv_group_configs] == [1, 2]
+    scheduler.manager.prepare_store.side_effect = lambda keys, req_context: (
+        generate_store_output(keys)
+    )
+
+    output = SchedulerOutput.make_empty()
+    output.kv_connector_block_state = KVConnectorBlockState(
+        req_ids=set(),
+        resolve_block_ids={}.__getitem__,
+        boundary_state_offloads={"req": [(2, 99, 16)]},
+    )
+    [job_id] = scheduler.build_connector_meta(output).store_jobs
+
+    # A null-block entry must never manufacture a reuse dependency.
+    null_job_id = job_id + 1000
+    scheduler._block_id_to_pending_jobs[0] = {null_job_id}
+
+    output = SchedulerOutput.make_empty()
+    if mutation == "scratch_allocation":
+        output.scheduled_cached_reqs.req_ids = ["req"]
+        output.scheduled_cached_reqs.new_block_ids = [
+            ([0, 99], [0, 11], [0, 21], [0, 98])
+        ]
+    elif mutation == "zeroing":
+        # This write need not appear in this step's selected-group allocations.
+        output.new_block_ids_to_zero = [0, 99]
+    else:
+        output.kv_cache_block_copies = [KVCacheBlockCopy(98, 99)]
+
+    meta = scheduler.build_connector_meta(output)
+
+    assert meta.jobs_to_flush == {job_id}
+    # Dense offload states must still select their original, sparse group IDs;
+    # gathering global reuse hazards must not append scratch IDs to either one.
+    state = scheduler._req_status["req"]
+    expected = ([0, 11], [0, 21]) if mutation == "scratch_allocation" else ([], [])
+    assert tuple(group.block_ids for group in state.group_states) == expected
 
 
 def test_normal_store_excludes_align_mode_mamba_sources():
@@ -4965,3 +5027,82 @@ class TestMambaHybridOffloadServing:
             False,
         ]
         assert self._roundtrip_served_tokens(scheduler) == 16
+
+
+@pytest.mark.parametrize("worker_count", [1, 8])
+@pytest.mark.parametrize("retention_interval", [None, 48])
+@pytest.mark.parametrize("blocks_per_chunk", [1, 3])
+@pytest.mark.parametrize("hybrid", [False, True])
+def test_incremental_store_preserves_transfer_trace(
+    worker_count, retention_interval, blocks_per_chunk, hybrid
+):
+    """Same request events must emit the same jobs, including finish and retries."""
+    traces = []
+    for enabled in [False, True]:
+        config = _make_vllm_config(
+            tensor_parallel_size=worker_count,
+            extra_config={
+                "blocks_per_chunk": blocks_per_chunk,
+                "offload_prompt_only": False,
+                "cpu_perf": {"incremental_store": enabled},
+            },
+        )
+        config.speculative_config = None
+        config.cache_config.block_size = 4
+        config.cache_config.prefix_cache_retention_interval = retention_interval
+        kwargs = dict(block_size=4, num_kv_heads=1, head_size=1, dtype=torch.float32)
+        groups = [KVCacheGroupSpec(["full"], FullAttentionSpec(**kwargs))]
+        if hybrid:
+            groups.append(
+                KVCacheGroupSpec(["swa"], SlidingWindowSpec(**kwargs, sliding_window=8))
+            )
+        cache = KVCacheConfig(
+            num_blocks=128, kv_cache_tensors=[], kv_cache_groups=groups
+        )
+        spec = MockOffloadingSpec(build_offloading_config(config, cache))
+        scheduler = OffloadingConnectorScheduler(spec, config, cache)
+        spec.manager.prepare_store.side_effect = lambda keys, context: (
+            generate_store_output(list(keys))
+        )
+        request = MagicMock()
+        request.request_id = "request"
+        request.num_prompt_tokens = request.num_tokens = 48
+        request.kv_transfer_params = request.kv_hints = request.lora_request = None
+        request.shared_prefix_boundary = None
+        request.is_finished.return_value = False
+        request.status = RequestStatus.RUNNING
+        request.block_hashes = [BlockHash(str(i).encode()) for i in range(12)]
+        request.all_token_ids = list(range(100))
+        scheduler.on_new_request(request)
+        state = scheduler._req_status["request"]
+        for group in state.group_states:
+            group.block_ids = list(range(1, 65))
+        trace = []
+        for step in range(42):
+            request.num_tokens = 49 + step
+            request.num_computed_tokens = 48 + step
+            request.block_hashes = [
+                BlockHash(str(i).encode()) for i in range(request.num_tokens // 4)
+            ]
+            state.update_offload_keys()
+            if step == 41:
+                request.is_finished.return_value = True
+                request.status = RequestStatus.FINISHED_LENGTH_CAPPED
+            output = SimpleNamespace(
+                num_scheduled_tokens={"request": 1},
+                finished_req_ids={"request"} if step == 41 else set(),
+            )
+            jobs = scheduler._build_store_jobs(output)
+            trace.append(
+                [
+                    (
+                        job.src_spec.block_ids.tolist(),
+                        job.src_spec.group_sizes,
+                        job.src_spec.block_indices,
+                        list(job.dst_spec.offload_keys),
+                    )
+                    for job in jobs.values()
+                ]
+            )
+        traces.append(trace)
+    assert traces[0] == traces[1]

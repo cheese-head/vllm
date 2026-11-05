@@ -11,6 +11,11 @@ class CPUOffloadingMetrics:
     CPU_ALLOCATION_SIZE = "vllm:kv_offload_cpu_allocation_size"
     CPU_CACHE_WRITE_USAGE_PERC = "vllm:kv_offload_cpu_cache_write_usage_perc"
     CPU_CACHE_READ_USAGE_PERC = "vllm:kv_offload_cpu_cache_read_usage_perc"
+    CPU_CACHE_SLOTS = "vllm:kv_offload_cpu_cache_slots"
+    CPU_STORE_ALLOCATION_FAILURES = "vllm:kv_offload_cpu_store_allocation_failures"
+    CPU_EVICTED_CHUNKS = "vllm:kv_offload_cpu_evicted_chunks"
+    CPU_MISSES_AFTER_EVICTION = "vllm:kv_offload_cpu_misses_after_eviction"
+    CPU_INVALIDATED_CHUNKS = "vllm:kv_offload_cpu_invalidated_chunks"
 
 
 class CPULoadStoreSpec(BlockIDsLoadStoreSpec):
@@ -24,3 +29,10 @@ class CPULoadStoreSpec(BlockIDsLoadStoreSpec):
     @property
     def chunk_ids(self) -> np.ndarray:
         return self.block_ids
+
+    @classmethod
+    def from_page_offsets(cls, offsets):
+        """Compact banks use 64-bit page coordinates, including banks over 8 TiB."""
+        result = cls([])
+        result.block_ids = np.array(offsets, dtype=np.int64)
+        return result

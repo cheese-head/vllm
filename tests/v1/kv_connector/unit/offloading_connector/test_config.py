@@ -164,13 +164,18 @@ def _mla_spec(
     dtype: torch.dtype = torch.float32,
     tokens_per_state: int = 1,
 ) -> MLAAttentionSpec:
+    replica_options = (
+        {"max_tp_shards": 1}
+        if "max_tp_shards" in MLAAttentionSpec.__dataclass_fields__
+        else {}
+    )
     return MLAAttentionSpec(
         block_size=block_size,
         num_kv_heads=1,
-        max_tp_shards=1,
         head_size=head_size,
         dtype=dtype,
         tokens_per_state=tokens_per_state,
+        **replica_options,
     )
 
 
@@ -1311,3 +1316,202 @@ def test_blocks_per_chunk_must_be_positive():
 
     with pytest.raises(ValueError, match="greater than 0"):
         build_offloading_config(config, _make_kv_cache_config())
+
+
+@pytest.mark.parametrize("world_size", [1, 8])
+@pytest.mark.parametrize("blocks_per_chunk", [1, 3])
+def test_compact_cpu_budget_creates_more_slots_without_exceeding_capacity(
+    world_size, blocks_per_chunk
+):
+    from vllm.v1.kv_offload.cpu.spec import CPUOffloadingSpec
+
+    results = []
+    for compact in [False, True]:
+        config = _make_vllm_config(
+            tensor_parallel_size=world_size,
+            extra_config={
+                "cpu_bytes_to_use": 1 << 30,
+                "blocks_per_chunk": blocks_per_chunk,
+                "cpu_perf": {"compact_groups": compact},
+            },
+        )
+        groups = [
+            KVCacheGroupSpec(["large"], _full_attention_spec()),
+            KVCacheGroupSpec(["small"], _full_attention_spec()),
+        ]
+        page = groups[0].kv_cache_spec.page_size_bytes
+        row = 2 * page
+        cache = KVCacheConfig(
+            num_blocks=8,
+            kv_cache_tensors=[
+                KVCacheTensor(
+                    size=8 * row,
+                    layers=["large", "small"],
+                    layer_stride=page,
+                    block_stride=row,
+                )
+            ],
+            kv_cache_groups=groups,
+        )
+        normalized = build_offloading_config(config, cache)
+        spec = CPUOffloadingSpec(normalized)
+        assert spec.num_chunks * spec.kv_bytes_per_chunk <= 1 << 30
+        if compact:
+            assert spec.cpu_page_size_per_worker == 4096
+            units = next(iter(spec.compact_group_units.values()))
+            results.append(spec.num_chunks // (1 << (units - 1).bit_length()))
+        else:
+            assert spec.cpu_page_size_per_worker == row * blocks_per_chunk
+            results.append(spec.num_chunks)
+    assert results[1] > results[0]
+
+
+@pytest.mark.parametrize("flag", ["early_load_ready", "precise_batching"])
+def test_cpu_perf_requires_explicit_executor(flag):
+    from vllm.v1.kv_offload.cpu.spec import CPUOffloadingSpec
+
+    config = _make_vllm_config(
+        extra_config={"cpu_bytes_to_use": 1 << 20, "cpu_perf": {flag: True}}
+    )
+    config.use_v2_model_runner = True
+    cache = KVCacheConfig(
+        num_blocks=8,
+        kv_cache_tensors=[],
+        kv_cache_groups=[KVCacheGroupSpec(["layer"], _full_attention_spec())],
+    )
+    with pytest.raises(ValueError, match="require cpu_copy_executor"):
+        CPUOffloadingSpec(build_offloading_config(config, cache))
+
+
+def test_compact_tiering_manager_uses_private_bank_and_preserves_tier_metrics():
+    from vllm.v1.kv_offload.base import LookupResult, ReqContext, make_offload_key
+
+    config = _make_vllm_config(
+        extra_config={
+            "cpu_bytes_to_use": 1 << 20,
+            "cpu_copy_executor": {"enabled": True},
+            "cpu_perf": {
+                "compact_groups": True,
+                "incremental_recency": True,
+                "incremental_store": True,
+                "precise_batching": True,
+                "early_load_ready": True,
+            },
+        }
+    )
+    config.use_v2_model_runner = True
+    spec = TieringOffloadingSpec(
+        build_offloading_config(config, _make_kv_cache_config())
+    )
+    manager = spec.get_manager()
+    assert spec._scheduler_mmap is None
+    assert manager.primary_tier._mmap_region is None
+    context = ReqContext("private")
+    manager.on_new_request(context)
+    key = make_offload_key(b"private", 0)
+    context.set_offload_key_position(key, 16)
+    try:
+        result = manager.prepare_store([key], context)
+        assert result is not None
+        manager.complete_store(result.keys_to_store, context)
+        assert manager.lookup(key, context) == LookupResult.HIT
+        manager.prepare_load([key], context)
+        manager.complete_load([key], context)
+        manager.on_request_finished(context)
+        assert manager.get_stats() is not None
+    finally:
+        manager.shutdown()
+
+
+@pytest.mark.parametrize("placement", ["auto", [0]])
+def test_compact_rejects_ignored_numa_placement(placement):
+    config = _make_vllm_config(
+        extra_config={"cpu_perf": {"compact_groups": True}, "cpu_numa_nodes": placement}
+    )
+    with pytest.raises(ValueError, match="cpu_numa_nodes"):
+        build_offloading_config(config, _make_kv_cache_config())
+
+
+@pytest.mark.parametrize("dtype", [torch.float16, torch.bfloat16, torch.uint8])
+@pytest.mark.parametrize("world_size", [1, 8])
+@pytest.mark.parametrize("blocks_per_chunk", [1, 3])
+def test_compact_preserves_heterogeneous_group_sizes_after_scheduler_flattening(
+    dtype, world_size, blocks_per_chunk
+):
+    from vllm.v1.kv_offload.cpu.spec import CPUOffloadingSpec
+
+    layers = {
+        "small": _mla_spec(block_size=64, head_size=132, dtype=dtype),
+        "large": _mla_spec(block_size=64, head_size=656, dtype=dtype),
+    }
+    uniform = UniformTypeKVCacheSpecs(block_size=64, kv_cache_specs=layers)
+    worker = KVCacheConfig(
+        num_blocks=8,
+        kv_cache_tensors=[],
+        kv_cache_groups=[KVCacheGroupSpec(list(layers), uniform)],
+    )
+    config = _make_vllm_config(
+        tensor_parallel_size=world_size,
+        extra_config={
+            "cpu_bytes_to_use": 1 << 30,
+            "blocks_per_chunk": blocks_per_chunk,
+            "cpu_perf": {"compact_groups": True},
+        },
+    )
+    scheduler = generate_scheduler_kv_cache_config([worker])
+    expected = sum(spec.page_size_bytes for spec in layers.values())
+    # The representative alone is insufficient for this actual layout family.
+    assert scheduler.kv_cache_groups[0].kv_cache_spec.page_size_bytes * 2 < expected
+    assert isinstance(worker.kv_cache_groups[0].kv_cache_spec, UniformTypeKVCacheSpecs)
+    worker_spec = CPUOffloadingSpec(build_offloading_config(config, worker))
+    scheduler_spec = CPUOffloadingSpec(build_offloading_config(config, scheduler))
+    assert scheduler.group_page_size_bytes == (expected,)
+    assert scheduler_spec.compact_group_units == worker_spec.compact_group_units
+    assert scheduler_spec.compact_group_units[0] * 4096 >= expected * blocks_per_chunk
+
+
+def test_compact_scheduler_reserves_maximum_worker_payload_for_partial_stages():
+    small = _mla_spec(block_size=64, head_size=132, dtype=torch.uint8)
+    large = _mla_spec(block_size=64, head_size=656, dtype=torch.uint8)
+    workers = [
+        KVCacheConfig(
+            num_blocks=8,
+            kv_cache_tensors=[],
+            kv_cache_groups=[
+                KVCacheGroupSpec(["p0"], small),
+                KVCacheGroupSpec([], small),
+            ],
+        ),
+        KVCacheConfig(
+            num_blocks=8,
+            kv_cache_tensors=[],
+            kv_cache_groups=[
+                KVCacheGroupSpec(["p1", "p2"], large),
+                KVCacheGroupSpec(["p3"], large),
+            ],
+        ),
+    ]
+    scheduler = generate_scheduler_kv_cache_config(workers)
+    expected = (2 * large.page_size_bytes, large.page_size_bytes)
+    assert scheduler.group_page_size_bytes == expected
+    config = _make_vllm_config(extra_config={"cpu_perf": {"compact_groups": True}})
+    assert (
+        build_offloading_config(config, scheduler).compact_group_page_sizes == expected
+    )
+    assert workers[0].group_page_size_bytes is None
+
+
+@pytest.mark.parametrize("sizes", [(1,), (1, 2, 3), (-1, 2), (None, 2)])
+def test_compact_rejects_invalid_preserved_group_sizes(sizes):
+    cache = KVCacheConfig(
+        num_blocks=8,
+        kv_cache_tensors=[],
+        kv_cache_groups=[
+            KVCacheGroupSpec(["a"], _full_attention_spec()),
+            KVCacheGroupSpec(["b"], _full_attention_spec()),
+        ],
+        group_page_size_bytes=sizes,
+    )
+    config = _make_vllm_config(extra_config={"cpu_perf": {"compact_groups": True}})
+    with pytest.raises(ValueError, match="preserved KV cache group"):
+        build_offloading_config(config, cache)

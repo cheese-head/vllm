@@ -15,6 +15,7 @@ if TYPE_CHECKING:
     from vllm.distributed.kv_transfer.kv_connector.v1.offloading.metrics import (
         OffloadingConnectorStats,
     )
+    from vllm.v1.kv_offload.cpu.transfer_lifecycle import CapturedStoreIntent
 
 from vllm.v1.kv_hints import KvHintsEnvelope
 from vllm.v1.kv_offload.config import OffloadingConfig
@@ -103,6 +104,9 @@ class ReqContext:
     _offload_key_positions: dict[OffloadKey, int] = field(
         default_factory=dict, repr=False, init=False
     )
+    _offload_key_parents: dict[OffloadKey, OffloadKey] = field(
+        default_factory=dict, repr=False, init=False
+    )
 
     def set_state(self, val: Any) -> None:
         self._state[type(val)] = val
@@ -115,6 +119,12 @@ class ReqContext:
 
     def get_offload_key_position(self, key: OffloadKey) -> int | None:
         return self._offload_key_positions.get(key)
+
+    def set_offload_key_parent(self, key: OffloadKey, parent: OffloadKey) -> None:
+        self._offload_key_parents[key] = parent
+
+    def get_offload_key_parent(self, key: OffloadKey) -> OffloadKey | None:
+        return self._offload_key_parents.get(key)
 
 
 class LookupResult(Enum):
@@ -536,6 +546,9 @@ class CanonicalKVCacheRef:
     page_size_bytes: int
     # How this worker's page maps into a canonical page; None = uncertified
     mapping: CanonicalPageMapping | None = None
+    # Direct compact layouts use distinct GPU and CPU byte coordinates.
+    gpu_offset_bytes: int = 0
+    host_offset_bytes: int = 0
 
 
 @dataclass
@@ -555,6 +568,8 @@ class CanonicalKVCaches:
     # Per-KV-cache-group list of data references that map each layer
     # in the group to the appropriate entry in the tensors list.
     group_data_refs: list[list[CanonicalKVCacheRef]]
+    compact_page_size_bytes: int | None = None
+    compact_group_page_sizes: tuple[int, ...] | None = None
 
 
 @dataclass
@@ -574,6 +589,30 @@ class OffloadingWorker(ABC):
     """Runs in the worker process. Performs async KV transfers for ONE
     offloaded medium (e.g. CPU). Direction is explicit via submit_store /
     submit_load, so there is no (src_medium, dst_medium) routing."""
+
+    def store_lifecycle_mode(self) -> str:
+        return "legacy"
+
+    def get_executor_statistics(self) -> dict[str, int | float]:
+        return {}
+
+    def store_lifecycle_limits(self) -> tuple[int, int]:
+        raise NotImplementedError("This worker has no captured-store capability")
+
+    def capture_store_dependency(self) -> Any:
+        raise NotImplementedError("This worker has no captured-store capability")
+
+    def capture_store(
+        self,
+        job_id: int,
+        src_spec: GPULoadStoreSpec,
+        dst_spec: LoadStoreSpec,
+        producer: Any,
+    ) -> "CapturedStoreIntent":
+        raise NotImplementedError("This worker has no captured-store capability")
+
+    def submit_store_intent(self, intent: "CapturedStoreIntent") -> bool:
+        raise NotImplementedError("This worker has no captured-store capability")
 
     @abstractmethod
     def submit_store(

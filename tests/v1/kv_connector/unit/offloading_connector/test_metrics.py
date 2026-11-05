@@ -11,10 +11,12 @@ from vllm.distributed.kv_transfer.kv_connector.v1.offloading.metrics import (
     OffloadingConnectorStats,
     OffloadPromMetrics,
     _ConnectorMetricName,
+    _ExecutorMetricName,
     _MetricType,
     _StatsKey,
     _TransferMetricName,
     get_connector_metric_definitions,
+    record_executor_statistics,
 )
 from vllm.distributed.kv_transfer.kv_connector.v1.offloading_connector import (
     OffloadingConnector,
@@ -784,3 +786,93 @@ def test_prom_metrics_rejects_undeclared_metric():
                 _StatsKey.DATA: {"unknown:metric": {(): 1}},
             }
         )
+
+
+def test_executor_interval_deltas_accumulate_and_gauges_replace_per_rank():
+    stats = OffloadingConnectorStats()
+    record_executor_statistics(
+        stats,
+        {
+            0: {
+                "queue_seconds": 0.25,
+                "accepted_jobs": 2.0,
+                "pending_jobs": 3.0,
+                "selective_enabled": 1.0,
+            },
+            1: {"queue_seconds": 0.5, "accepted_jobs": 4.0, "pending_jobs": 2.0},
+        },
+    )
+    record_executor_statistics(
+        stats,
+        {0: {"queue_seconds": 0.125, "accepted_jobs": 1.0, "pending_jobs": 0.0}},
+    )
+    values = stats.to_dict()[_StatsKey.DATA]
+    assert values[_ExecutorMetricName.TIME] == {
+        ("0", "queue"): 0.375,
+        ("1", "queue"): 0.5,
+    }
+    assert values[_ExecutorMetricName.OPERATIONS] == {
+        ("0", "accepted"): 3.0,
+        ("1", "accepted"): 4.0,
+    }
+    assert values[_ExecutorMetricName.PENDING_JOBS] == {("0",): 0.0, ("1",): 2.0}
+    assert values[_ExecutorMetricName.SELECTIVE_ENABLED] == {("0",): 1.0}
+
+
+def test_executor_metrics_export_uses_only_declared_bounded_labels():
+    stats = OffloadingConnectorStats()
+    record_executor_statistics(
+        stats,
+        {
+            3: {
+                "capture_seconds": 0.01,
+                "fence_calls": 2.0,
+                "capacity_fallbacks": 1.0,
+                "pending_metadata_bytes": 32.0,
+                "request_id": "must-not-be-a-label",
+            }
+        },
+    )
+    definitions = get_connector_metric_definitions()
+    assert isinstance(definitions[_ExecutorMetricName.TIME], OffloadingCounterMetadata)
+    assert definitions[_ExecutorMetricName.TIME].labelnames == ("rank", "stage")
+    assert definitions[_ExecutorMetricName.OPERATIONS].labelnames == ("rank", "kind")
+    assert isinstance(
+        definitions[_ExecutorMetricName.PENDING_METADATA], OffloadingGaugeMetadata
+    )
+    prom_metrics = OffloadPromMetrics(
+        vllm_config=_FakeVllmConfig(),
+        metric_types={Gauge: _FakeMetric, Counter: _FakeMetric, Histogram: _FakeMetric},
+        labelnames=["model_name"],
+        per_engine_labelvalues={0: ["model"]},
+    )
+    prom_metrics.observe(stats.to_dict(), engine_idx=0)
+    time_metric = prom_metrics.offloading_metrics[
+        (0, _ExecutorMetricName.TIME, ("3", "capture"))
+    ]
+    assert time_metric.increments == [0.01]
+    metadata_metric = prom_metrics.offloading_metrics[
+        (0, _ExecutorMetricName.PENDING_METADATA, ("3",))
+    ]
+    assert metadata_metric.set_values == [32.0]
+    assert "must-not-be-a-label" not in repr(stats.to_dict())
+
+
+@pytest.mark.parametrize("invalid", [-0.1, float("nan"), float("inf"), "0.5"])
+def test_executor_invalid_frame_does_not_partly_count_an_interval(invalid):
+    stats = OffloadingConnectorStats()
+    with pytest.raises(ValueError, match="Invalid executor statistic"):
+        record_executor_statistics(
+            stats,
+            {0: {"accepted_jobs": 1.0}, 1: {"queue_seconds": invalid}},
+        )
+    assert stats.is_empty()
+
+
+def test_executor_rejects_invalid_rank_and_nonboolean_mode_snapshot():
+    stats = OffloadingConnectorStats()
+    with pytest.raises(ValueError, match="rank"):
+        record_executor_statistics(stats, {-1: {"accepted_jobs": 1.0}})
+    with pytest.raises(ValueError, match="selective_enabled"):
+        record_executor_statistics(stats, {0: {"selective_enabled": 2.0}})
+    assert stats.is_empty()

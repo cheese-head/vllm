@@ -17,6 +17,8 @@ from vllm.v1.kv_offload.cpu.copy_executor import (
     CopyExecutorConfig,
     PhysicalCopyStats,
 )
+from vllm.v1.kv_offload.cpu.perf import CopyScope, merge_intervals
+from vllm.v1.kv_offload.cpu.transfer_lifecycle import RecordedDependencies
 
 
 @dataclass
@@ -43,7 +45,9 @@ class _Ticket:
 
 
 class CudaCopyBackend:
-    def __init__(self, store_handler, load_handler, allocate_buffers):
+    def __init__(
+        self, store_handler, load_handler, allocate_buffers, *, precise_batching=False
+    ):
         self.handlers = {"store": store_handler, "load": load_handler}
         self.device = store_handler.src_tensors[0].device
         self.allocate_buffers = allocate_buffers
@@ -52,6 +56,49 @@ class CudaCopyBackend:
         self._buffers: list[tuple] = []
         self._events: list[Any] = []
         self._closed = False
+        self.precise_batching = precise_batching
+        self._geometry = {}
+        if precise_batching:
+            # Bind the dependency policy once, outside the per-batch path.
+            self.extend_batch = self._extend_precise_batch  # type: ignore[method-assign]
+            for direction, handler in self.handlers.items():
+                plans = handler._canonical_copy_plans
+                self._geometry[direction] = tuple(
+                    (
+                        sum(p.num_frags for p in plans[i])
+                        if plans is not None
+                        else len(refs),
+                        sum(p.total_bytes for p in plans[i])
+                        if plans is not None
+                        else sum(r.page_size_bytes for r in refs),
+                    )
+                    for i, refs in enumerate(handler.layer_refs_per_group)
+                )
+
+    @staticmethod
+    def _extend_precise_batch(scope, candidate):
+        data = candidate.data
+        ranges = CopyScope(
+            merge_intervals(
+                (int(a), int(a) + int(n)) for a, n in zip(data.src, data.sizes) if n
+            ),
+            merge_intervals(
+                (int(a), int(a) + int(n)) for a, n in zip(data.dst, data.sizes) if n
+            ),
+        )
+        return ranges if scope is None else scope.extend(ranges)
+
+    @staticmethod
+    def _coalesce(data):
+        if len(data.sizes) < 2:
+            return data
+        adjacent = (data.src[1:] == data.src[:-1] + data.sizes[:-1]) & (
+            data.dst[1:] == data.dst[:-1] + data.sizes[:-1]
+        )
+        starts = np.r_[0, np.flatnonzero(~adjacent) + 1]
+        return _Descriptors(
+            data.src[starts], data.dst[starts], np.add.reduceat(data.sizes, starts)
+        )
 
     def setup(self):
         current_platform.set_device(self.device)
@@ -125,19 +172,24 @@ class CudaCopyBackend:
             ):
                 group_ids = ids[offset : offset + count]
                 limit = min((tensors[r.tensor_idx].shape[0] for r in refs), default=0)
-                if len(group_ids) and (group_ids.min() < 0 or group_ids.max() >= limit):
+                if len(group_ids) and (
+                    group_ids.min() < 0 or (refs and group_ids.max() >= limit)
+                ):
                     raise ValueError("Native copy block ID outside its tensor")
             plans = handler._canonical_copy_plans
-            per_block = (
-                sum(p.num_frags for p in plans[group])
-                if plans is not None
-                else len(refs)
-            )
-            bytes_per_block = (
-                sum(p.total_bytes for p in plans[group])
-                if plans is not None
-                else sum(r.page_size_bytes for r in refs)
-            )
+            if self.precise_batching:
+                per_block, bytes_per_block = self._geometry[direction][group]
+            else:
+                per_block = (
+                    sum(p.num_frags for p in plans[group])
+                    if plans is not None
+                    else len(refs)
+                )
+                bytes_per_block = (
+                    sum(p.total_bytes for p in plans[group])
+                    if plans is not None
+                    else sum(r.page_size_bytes for r in refs)
+                )
             # One logical block is atomic at the layout adapter. Targets may
             # be exceeded only by that single model-defined block.
             blocks = max(
@@ -177,6 +229,9 @@ class CudaCopyBackend:
                     0,
                 )
                 data = _Descriptors(*(a[:used].view(np.uint64) for a in arrays))
+                if self.precise_batching:
+                    data = self._coalesce(data)
+                    used = len(data.sizes)
                 final = group == nonempty[-1] and offset + count == size
                 if final and (
                     src_offset + src_count != len(src)
@@ -212,7 +267,10 @@ class CudaCopyBackend:
         # Retain buffers even if submission fails after accepting some DMA.
         self._tickets.add(ticket)
         for producer in producers:
-            stream.wait_event(producer)
+            if isinstance(producer, RecordedDependencies):
+                producer.wait_on(stream)
+            else:
+                stream.wait_event(producer)
         with current_platform.stream(stream):
             start.record(stream)
             if count:

@@ -119,6 +119,11 @@ class OffloadingConnector(KVConnectorBase_V1, SupportsHMA):
         assert isinstance(self._connector_metadata, OffloadingConnectorMetadata)
         self.connector_worker.start_kv_transfers(self._connector_metadata)
 
+    def record_load_destination_ready(self, metadata: KVConnectorMetadata) -> None:
+        assert self.connector_worker is not None
+        assert isinstance(metadata, OffloadingConnectorMetadata)
+        self.connector_worker.record_load_destination_ready(metadata)
+
     def wait_for_layer_load(self, layer_name: str) -> None:
         pass
 
